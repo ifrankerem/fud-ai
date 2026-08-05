@@ -552,6 +552,11 @@ struct HomeView: View {
     @State private var showCopyFromDaySheet = false
     @State private var pendingContextImage: UIImage?
     @State private var captureImages: [UIImage] = []
+    /// What each captured photo is meant to prove, parallel to captureImages.
+    @State private var capturePhotoKinds: [PhotoEvidenceKind] = []
+    /// Labels for the photos behind the estimate on screen, so a refinement
+    /// re-sends them with the same meaning rather than as anonymous images.
+    @State private var currentPhotoKinds: [PhotoEvidenceKind] = []
     @State private var isImportingPhotos = false
     @State private var showMultiPhotoCaptureSheet = false
     @State private var contextDescription: String = ""
@@ -1081,6 +1086,7 @@ struct HomeView: View {
             .sheet(isPresented: $showMultiPhotoCaptureSheet) {
                 MultiPhotoCaptureSheet(
                     images: $captureImages,
+                    photoKinds: $capturePhotoKinds,
                     isImportingPhotos: isImportingPhotos,
                     selectedPhotoItems: $selectedPhotoItems,
                     description: $contextDescription,
@@ -1094,24 +1100,30 @@ struct HomeView: View {
                     onRemove: { index in
                         guard captureImages.indices.contains(index) else { return }
                         captureImages.remove(at: index)
+                        if capturePhotoKinds.indices.contains(index) {
+                            capturePhotoKinds.remove(at: index)
+                        }
                         if captureImages.isEmpty {
                             showMultiPhotoCaptureSheet = false
                         }
                     },
                     onAnalyze: {
                         let images = captureImages
+                        let kinds = capturePhotoKinds
                         let description = cameraMode == .snapFoodWithContext ? contextDescription : nil
                         showMultiPhotoCaptureSheet = false
                         captureImages = []
+                        capturePhotoKinds = []
                         currentImages = images
                         currentImage = images.first
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                            startAnalysis(images: images, mode: cameraMode, description: description)
+                            startAnalysis(images: images, mode: cameraMode, description: description, photoKinds: kinds)
                         }
                     },
                     onCancel: {
                         showMultiPhotoCaptureSheet = false
                         captureImages = []
+                        capturePhotoKinds = []
                         contextDescription = ""
                     }
                 )
@@ -1379,13 +1391,28 @@ struct HomeView: View {
         }
     }
 
+    /// Pairs photos with their labels, tolerating a short or missing label array —
+    /// photos arrive from the camera, the picker and the share sheet, and an
+    /// unlabelled one is simply an ordinary photo of the meal.
+    private func labelledImages(_ images: [UIImage], kinds: [PhotoEvidenceKind]) -> [LabelledImage] {
+        images.enumerated().map { index, image in
+            LabelledImage(image: image, kind: kinds.indices.contains(index) ? kinds[index] : .other)
+        }
+    }
+
     private func startAnalysis(image: UIImage, mode: CameraMode, description: String? = nil) {
         startAnalysis(images: [image], mode: mode, description: description)
     }
 
-    private func startAnalysis(images: [UIImage], mode: CameraMode, description: String? = nil) {
+    private func startAnalysis(
+        images: [UIImage],
+        mode: CameraMode,
+        description: String? = nil,
+        photoKinds: [PhotoEvidenceKind] = []
+    ) {
         retryRequest = .analysis(images: images, mode: mode, description: description)
         lastAnalysisRequest = retryRequest
+        currentPhotoKinds = photoKinds
         activeSheet = .analyzing
 
         Task {
@@ -1393,7 +1420,8 @@ struct HomeView: View {
                 let outcome = try await analysisOutcome(
                     images: images,
                     mode: mode,
-                    description: description
+                    description: description,
+                    photoKinds: photoKinds
                 )
                 currentAnalysisOutcome = outcome
                 currentFoodResult = outcome.analysis
@@ -1417,9 +1445,10 @@ struct HomeView: View {
     private func analysisOutcome(
         images: [UIImage],
         mode: CameraMode,
-        description: String?
+        description: String?,
+        photoKinds: [PhotoEvidenceKind]
     ) async throws -> MealAnalysisOutcome {
-        let labelled = images.map { LabelledImage(image: $0, kind: .other) }
+        let labelled = labelledImages(images, kinds: photoKinds)
         let note = mode == .snapFoodWithContext ? description : nil
 
         do {
@@ -1493,7 +1522,7 @@ struct HomeView: View {
               case let .analysis(images, mode, description) = request
         else { return }
 
-        let labelled = images.map { LabelledImage(image: $0, kind: .other) }
+        let labelled = labelledImages(images, kinds: currentPhotoKinds)
         let note = mode == .snapFoodWithContext ? description : nil
         activeSheet = .analyzing
 
@@ -1523,7 +1552,10 @@ struct HomeView: View {
         guard let retryRequest else { return }
         switch retryRequest {
         case let .analysis(images, mode, description):
-            startAnalysis(images: images, mode: mode, description: description)
+            // Labels the user set are not in the retry request, but they are still
+            // the labels for these photos — losing them on a retry would quietly
+            // downgrade a scale reading back to an ordinary picture.
+            startAnalysis(images: images, mode: mode, description: description, photoKinds: currentPhotoKinds)
         case let .text(description):
             startTextAnalysis(description)
         case let .barcode(barcode):
@@ -2197,6 +2229,10 @@ private struct NativeSheetToolbarButton: View {
 // MARK: - Multi-photo Capture Review
 struct MultiPhotoCaptureSheet: View {
     @Binding var images: [UIImage]
+    /// What each photo is meant to prove, parallel to `images`. Kept as a separate
+    /// array rather than a dictionary because photo order is what the user sees and
+    /// what indices refer to after a removal.
+    @Binding var photoKinds: [PhotoEvidenceKind]
     let isImportingPhotos: Bool
     @Binding var selectedPhotoItems: [PhotosPickerItem]
     @Binding var description: String
@@ -2205,6 +2241,20 @@ struct MultiPhotoCaptureSheet: View {
     let onAnalyze: () -> Void
     let onCancel: () -> Void
     @State private var showAdditionalPhotoPicker = false
+
+    /// Photos can be added from several paths, so the label array is padded on read
+    /// rather than relying on every one of them to keep it in step.
+    private func kind(at index: Int) -> PhotoEvidenceKind {
+        photoKinds.indices.contains(index) ? photoKinds[index] : .other
+    }
+
+    private func setKind(_ kind: PhotoEvidenceKind, at index: Int) {
+        guard images.indices.contains(index) else { return }
+        while photoKinds.count <= index {
+            photoKinds.append(.other)
+        }
+        photoKinds[index] = kind
+    }
 
     var body: some View {
         NavigationStack {
@@ -2235,13 +2285,34 @@ struct MultiPhotoCaptureSheet: View {
                                         .padding(10)
                                     }
                                     .overlay(alignment: .bottomLeading) {
-                                        Text("Photo \(index + 1)")
+                                        // Photos are not interchangeable: a scale
+                                        // display is a measurement, a second angle
+                                        // is the same food again. Saying which is
+                                        // which is what lets the analysis apply
+                                        // those rules instead of guessing.
+                                        Menu {
+                                            ForEach(PhotoEvidenceKind.allCases, id: \.self) { kind in
+                                                Button {
+                                                    setKind(kind, at: index)
+                                                } label: {
+                                                    Label(kind.displayName, systemImage: kind.symbolName)
+                                                }
+                                            }
+                                        } label: {
+                                            let kind = self.kind(at: index)
+                                            HStack(spacing: 5) {
+                                                Image(systemName: kind.symbolName)
+                                                Text(kind == .other ? "Photo \(index + 1)" : kind.displayName)
+                                                Image(systemName: "chevron.down")
+                                                    .font(.caption2)
+                                            }
                                             .font(.caption.weight(.semibold))
                                             .foregroundStyle(.white)
                                             .padding(.horizontal, 10)
                                             .padding(.vertical, 6)
                                             .background(.black.opacity(0.55), in: Capsule())
                                             .padding(10)
+                                        }
                                     }
                             }
                         }
