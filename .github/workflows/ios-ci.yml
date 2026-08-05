@@ -1,0 +1,311 @@
+# Builds and unit-tests the iOS app on GitHub-hosted macOS runners.
+#
+# This exists because the app is developed on Fedora, where Xcode cannot run —
+# so this workflow is the only place real Swift/Xcode compiler errors appear.
+# It therefore stays strict on purpose: nothing here weakens a compiler check to
+# make a run go green. Signing is disabled because simulator CI needs no
+# certificates; that is the only build setting overridden.
+#
+# Sibling workflow ios-release.yml handles tagged GitHub Releases and is
+# unrelated to this one.
+
+name: iOS CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "feature/**"
+      - "fix/**"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "macOS runner image (switch if the default lacks a new enough Xcode)"
+        required: false
+        default: macos-15
+        type: choice
+        options:
+          - macos-15
+          - macos-26
+          - macos-latest
+      run_ui_tests:
+        description: "Also run the non-blocking UI test target"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  XCODE_PROJECT: ios/calorietracker.xcodeproj
+  SCHEME: calorietracker
+  UNIT_TEST_TARGET: calorietrackerTests
+  UI_TEST_TARGET: calorietrackerUITests
+  # calorietrackerTests sets IPHONEOS_DEPLOYMENT_TARGET = 26.2, so a simulator
+  # older than that cannot host the unit-test bundle no matter how new the
+  # iPhone model is. Simulator selection filters on this, not on device name.
+  MIN_SIMULATOR_IOS: "26.2"
+
+jobs:
+  build-test:
+    name: Build & test on iOS Simulator
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The repo pins nothing, but the project is Xcode 26-era (objectVersion 77,
+      # LastUpgradeCheck 2640) and the test bundle needs the iOS 26.2 SDK. Rather
+      # than hardcode a path that rots, pick the newest Xcode actually installed.
+      - name: Select newest installed Xcode
+        run: |
+          set -euo pipefail
+          echo "Installed Xcode versions:"
+          best_app=""
+          best_ver=""
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            ver="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            [ -n "$ver" ] || continue
+            echo "  $ver  ->  $app"
+            if [ -z "$best_ver" ] || [ "$(printf '%s\n%s\n' "$best_ver" "$ver" | sort -V | tail -1)" = "$ver" ]; then
+              best_app="$app"
+              best_ver="$ver"
+            fi
+          done
+          if [ -z "$best_app" ]; then
+            echo "::error::No Xcode installation found under /Applications."
+            exit 1
+          fi
+          echo "Selecting Xcode $best_ver ($best_app)"
+          sudo xcode-select -s "$best_app/Contents/Developer"
+          echo "DEVELOPER_DIR=$best_app/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Inspect environment
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-logs"
+          {
+            sw_vers
+            echo
+            xcodebuild -version
+            echo
+            swift --version
+            echo
+            echo "--- Simulator runtimes ---"
+            xcrun simctl list runtimes
+            echo
+            echo "--- Available devices ---"
+            xcrun simctl list devices available
+          } 2>&1 | tee "$RUNNER_TEMP/ci-logs/environment.txt"
+
+      - name: Validate project and shared scheme
+        run: |
+          set -euo pipefail
+          if [ ! -d "$XCODE_PROJECT" ]; then
+            echo "::error::Xcode project not found at $XCODE_PROJECT"
+            exit 1
+          fi
+
+          xcodebuild -project "$XCODE_PROJECT" -list \
+            2>&1 | tee "$RUNNER_TEMP/ci-logs/xcodebuild-list.txt"
+
+          if ! xcodebuild -project "$XCODE_PROJECT" -list -json \
+                | jq -e --arg s "$SCHEME" '.project.schemes | index($s)' > /dev/null; then
+            echo "::error::Scheme '$SCHEME' is not a shared scheme of $XCODE_PROJECT."
+            echo "Share it in Xcode: Product > Scheme > Manage Schemes > tick 'Shared',"
+            echo "then commit ios/calorietracker.xcodeproj/xcshareddata/xcschemes/."
+            exit 1
+          fi
+          echo "Shared scheme '$SCHEME' found."
+
+      # Only remote package: RevenueCat/purchases-ios. Keyed on Package.resolved
+      # so a dependency bump invalidates the cache instead of poisoning it.
+      - name: Cache Swift Package Manager
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles('ios/calorietracker.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Resolve Swift package dependencies
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project "$XCODE_PROJECT" \
+            -scheme "$SCHEME" \
+            2>&1 | tee "$RUNNER_TEMP/ci-logs/resolve-packages.txt"
+
+      # Builds the app plus everything the scheme embeds: the widget extension,
+      # the share extension, and the watchOS app and its widgets.
+      - name: Build for iOS Simulator
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build \
+            2>&1 | tee "$RUNNER_TEMP/ci-logs/build.txt"
+
+      - name: Select iPhone simulator
+        id: simulator
+        run: |
+          set -euo pipefail
+          xcrun simctl list devices available -j > "$RUNNER_TEMP/ci-logs/devices.json"
+
+          # Runtime identifiers look like com.apple.CoreSimulator.SimRuntime.iOS-26-2.
+          # Emit "<version>\t<name>\t<udid>" so the newest runtime sorts first and
+          # non-iPhone devices (Watch, iPad, TV) never enter the running.
+          candidates="$(jq -r '
+            .devices
+            | to_entries[]
+            | select(.key | contains("SimRuntime.iOS-"))
+            | . as $entry
+            | ($entry.key | sub(".*SimRuntime\\.iOS-"; "") | gsub("-"; ".")) as $version
+            | $entry.value[]
+            | select(.isAvailable == true)
+            | select(.name | startswith("iPhone"))
+            | "\($version)\t\(.name)\t\(.udid)"
+          ' "$RUNNER_TEMP/ci-logs/devices.json" | sort -V -r)"
+
+          if [ -z "$candidates" ]; then
+            echo "::error::No available iPhone simulator on this runner."
+            echo "Runtimes present:"
+            jq -r '.devices | keys[]' "$RUNNER_TEMP/ci-logs/devices.json" || true
+            exit 1
+          fi
+
+          echo "Available iPhone simulators (newest runtime first):"
+          printf '%s\n' "$candidates"
+
+          best="$(printf '%s\n' "$candidates" | head -1)"
+          sim_version="$(printf '%s' "$best" | cut -f1)"
+          sim_name="$(printf '%s' "$best" | cut -f2)"
+          sim_udid="$(printf '%s' "$best" | cut -f3)"
+
+          # sort -V puts the smaller version first; if that is not the minimum,
+          # the newest simulator present is still too old to host the tests.
+          if [ "$(printf '%s\n%s\n' "$MIN_SIMULATOR_IOS" "$sim_version" | sort -V | head -1)" != "$MIN_SIMULATOR_IOS" ]; then
+            echo "::error::Newest available iPhone runtime is iOS $sim_version, but the"
+            echo "::error::$UNIT_TEST_TARGET bundle targets iOS $MIN_SIMULATOR_IOS."
+            echo "Re-run this workflow with a newer runner image (workflow_dispatch > runner),"
+            echo "or lower IPHONEOS_DEPLOYMENT_TARGET on the test target."
+            exit 1
+          fi
+
+          echo "Selected: $sim_name (iOS $sim_version) $sim_udid"
+          {
+            echo "udid=$sim_udid"
+            echo "name=$sim_name"
+            echo "version=$sim_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Boot simulator
+        env:
+          SIMULATOR_UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          set -euo pipefail
+          # Booting an already-booted device exits non-zero; that is not a failure.
+          xcrun simctl boot "$SIMULATOR_UDID" || true
+          xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+
+      # The required gate. UI tests are excluded here and run separately below so
+      # a flaky simulator launch cannot mask a real unit-test regression.
+      - name: Run unit tests
+        env:
+          SIMULATOR_UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/TestResults.xcresult" \
+            -only-testing:"$UNIT_TEST_TARGET" \
+            CODE_SIGNING_ALLOWED=NO \
+            test \
+            2>&1 | tee "$RUNNER_TEMP/ci-logs/unit-tests.txt"
+
+      # calorietrackerUITests currently holds the stock Xcode template stubs: they
+      # launch the app and assert nothing, and testLaunchPerformance relaunches
+      # repeatedly. Useful as a smoke signal, too flaky to gate a merge on — hence
+      # reported but non-blocking rather than silently dropped.
+      - name: Run UI tests (non-blocking)
+        id: ui_tests
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_ui_tests }}
+        continue-on-error: true
+        env:
+          SIMULATOR_UDID: ${{ steps.simulator.outputs.udid }}
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/UITestResults.xcresult" \
+            -only-testing:"$UI_TEST_TARGET" \
+            CODE_SIGNING_ALLOWED=NO \
+            test \
+            2>&1 | tee "$RUNNER_TEMP/ci-logs/ui-tests.txt"
+
+      - name: Summarise run
+        if: always()
+        env:
+          SIM_NAME: ${{ steps.simulator.outputs.name }}
+          SIM_VERSION: ${{ steps.simulator.outputs.version }}
+          UI_OUTCOME: ${{ steps.ui_tests.outcome }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### iOS CI"
+            echo
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Runner | \`${{ runner.os }} / ${{ inputs.runner || 'macos-15' }}\` |"
+            echo "| Xcode | \`$(xcodebuild -version | head -1)\` |"
+            echo "| Scheme | \`$SCHEME\` |"
+            echo "| Simulator | \`${SIM_NAME:-n/a} (iOS ${SIM_VERSION:-n/a})\` |"
+            echo "| UI tests | \`${UI_OUTCOME:-skipped}\` (non-blocking) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # DerivedData itself is deliberately not uploaded — it runs to gigabytes and
+      # the xcresult bundles already carry the diagnostics worth reading.
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          cp -R "$RUNNER_TEMP/ci-logs" "$RUNNER_TEMP/artifacts/logs" 2>/dev/null || true
+          for bundle in TestResults UITestResults; do
+            if [ -d "$RUNNER_TEMP/$bundle.xcresult" ]; then
+              cp -R "$RUNNER_TEMP/$bundle.xcresult" "$RUNNER_TEMP/artifacts/" || true
+            fi
+          done
+          ls -la "$RUNNER_TEMP/artifacts"
+
+      - name: Upload test results and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-results
+          path: ${{ runner.temp }}/artifacts
+          if-no-files-found: warn
+          retention-days: 14
