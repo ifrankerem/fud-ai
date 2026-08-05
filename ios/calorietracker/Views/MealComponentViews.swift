@@ -215,7 +215,8 @@ struct AssumptionsSection: View {
 /// Answering re-runs the analysis with the answers folded into the context.
 struct ClarifyingQuestionsView: View {
     let questions: [ClarifyingQuestion]
-    @Binding var answers: [UUID: String]
+    /// Keyed by the question's stable id, which travels to the model and back.
+    @Binding var answers: [String: String]
     let isRefining: Bool
     let onRefine: () -> Void
 

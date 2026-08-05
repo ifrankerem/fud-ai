@@ -66,7 +66,7 @@ struct FoodResultView: View {
     @State private var mealConfidence: ConfidenceScore?
     @State private var assumptions: [String]
     @State private var clarifyingQuestions: [ClarifyingQuestion]
-    @State private var questionAnswers: [UUID: String] = [:]
+    @State private var questionAnswers: [String: String] = [:]
     @State private var isRefining = false
 
     let logDate: Date

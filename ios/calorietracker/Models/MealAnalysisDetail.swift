@@ -114,6 +114,10 @@ struct CalorieRange: Codable, Hashable {
 /// One part of a plate — grilled chicken, rice, salad, the oil it was cooked in.
 struct MealComponent: Identifiable, Codable, Hashable {
     var id: UUID
+    /// Identity that survives the round trip through the model, so a follow-up
+    /// analysis can update this exact component instead of returning a new list
+    /// that has to be re-matched by name. `id` stays the local, UI-stable key.
+    var stableID: String
     var name: String
     var grams: Double
     var calories: Int
@@ -126,9 +130,22 @@ struct MealComponent: Identifiable, Codable, Hashable {
     var isHidden: Bool
     /// Why this component looks the way it does, e.g. "assumed 1 tbsp olive oil".
     var note: String?
+    /// Where `grams` came from. Drives whether the app asks about this component's
+    /// weight, and whether a later pass may overwrite it.
+    var quantitySource: QuantitySource
+    /// "grilled", "deep-fried", "steamed". Often worth more calories than the
+    /// portion size, which is why it is worth a question of its own.
+    var preparationMethod: String?
+    /// Plausible bounds for this component alone. Meal totals are summed from
+    /// these rather than estimated separately.
+    var calorieRange: CalorieRange?
+    /// What is specifically unknown here, e.g. "cooked weight not visible".
+    /// Distinct from `note`, which states what was assumed.
+    var uncertainties: [String]
 
     init(
         id: UUID = UUID(),
+        stableID: String? = nil,
         name: String,
         grams: Double,
         calories: Int,
@@ -137,9 +154,14 @@ struct MealComponent: Identifiable, Codable, Hashable {
         fat: Double,
         confidence: ConfidenceScore? = nil,
         isHidden: Bool = false,
-        note: String? = nil
+        note: String? = nil,
+        quantitySource: QuantitySource = .visualEstimate,
+        preparationMethod: String? = nil,
+        calorieRange: CalorieRange? = nil,
+        uncertainties: [String] = []
     ) {
         self.id = id
+        self.stableID = stableID ?? id.uuidString
         self.name = name
         self.grams = max(0, grams)
         self.calories = max(0, calories)
@@ -149,10 +171,68 @@ struct MealComponent: Identifiable, Codable, Hashable {
         self.confidence = confidence
         self.isHidden = isHidden
         self.note = note
+        self.quantitySource = quantitySource
+        self.preparationMethod = preparationMethod
+        self.calorieRange = calorieRange
+        self.uncertainties = uncertainties
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, grams, calories, protein, carbs, fat, confidence, isHidden, note
+        case stableID, quantitySource, preparationMethod, calorieRange, uncertainties
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+        grams = try container.decodeIfPresent(Double.self, forKey: .grams) ?? 0
+        calories = try container.decodeIfPresent(Int.self, forKey: .calories) ?? 0
+        protein = try container.decodeIfPresent(Double.self, forKey: .protein) ?? 0
+        carbs = try container.decodeIfPresent(Double.self, forKey: .carbs) ?? 0
+        fat = try container.decodeIfPresent(Double.self, forKey: .fat) ?? 0
+        confidence = try container.decodeIfPresent(ConfidenceScore.self, forKey: .confidence)
+        isHidden = try container.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false
+        note = try container.decodeIfPresent(String.self, forKey: .note)
+        stableID = try container.decodeIfPresent(String.self, forKey: .stableID) ?? id.uuidString
+        // Components stored before provenance existed were all visual estimates —
+        // claiming .unknown would be equally wrong and would start asking about
+        // weights the analysis had in fact estimated.
+        quantitySource = try container.decodeIfPresent(QuantitySource.self, forKey: .quantitySource) ?? .visualEstimate
+        preparationMethod = try container.decodeIfPresent(String.self, forKey: .preparationMethod)
+        calorieRange = try container.decodeIfPresent(CalorieRange.self, forKey: .calorieRange)
+        uncertainties = try container.decodeIfPresent([String].self, forKey: .uncertainties) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(grams, forKey: .grams)
+        try container.encode(calories, forKey: .calories)
+        try container.encode(protein, forKey: .protein)
+        try container.encode(carbs, forKey: .carbs)
+        try container.encode(fat, forKey: .fat)
+        try container.encodeIfPresent(confidence, forKey: .confidence)
+        try container.encode(isHidden, forKey: .isHidden)
+        try container.encodeIfPresent(note, forKey: .note)
+        if stableID != id.uuidString { try container.encode(stableID, forKey: .stableID) }
+        if quantitySource != .visualEstimate { try container.encode(quantitySource, forKey: .quantitySource) }
+        try container.encodeIfPresent(preparationMethod, forKey: .preparationMethod)
+        try container.encodeIfPresent(calorieRange, forKey: .calorieRange)
+        if !uncertainties.isEmpty { try container.encode(uncertainties, forKey: .uncertainties) }
+    }
+
+    /// Whether the app already knows this component's amount well enough that
+    /// asking about it would waste one of the three available questions.
+    var hasExactQuantity: Bool { quantitySource.isExact }
+
+    /// Quantity plus provenance, e.g. "185 g · Measured".
+    var quantityDisplay: String {
+        let amount = grams >= 10 || grams == grams.rounded()
+            ? String(Int(grams.rounded()))
+            : String(format: "%.1f", grams)
+        return "\(amount) g · \(quantitySource.displayLabel)"
     }
 
     func scaled(by factor: Double) -> MealComponent {
@@ -163,6 +243,7 @@ struct MealComponent: Identifiable, Codable, Hashable {
         copy.protein = protein * factor
         copy.carbs = carbs * factor
         copy.fat = fat * factor
+        copy.calorieRange = calorieRange?.scaled(by: factor)
         return copy
     }
 
@@ -175,41 +256,222 @@ struct MealComponent: Identifiable, Codable, Hashable {
     }
 }
 
+/// What kind of control answers a question.
+///
+/// A weight cannot be answered by tapping a chip, and "grilled or fried" should
+/// not require typing. Matching the control to the question is most of what makes
+/// answering fast enough that people bother.
+enum ClarifyingQuestionKind: String, Codable, CaseIterable, Hashable {
+    /// A number plus a unit — the highest-value answer, since it converts a guess
+    /// into a measurement.
+    case numericMeasurement
+    case singleChoice
+    case yesNo
+    case freeText
+    /// Asks for another photo rather than an answer.
+    case requestAdditionalPhoto
+
+    static func parse(_ raw: Any?, optionCount: Int) -> ClarifyingQuestionKind {
+        guard let string = raw as? String else {
+            // No declared kind: infer from shape. Options mean a choice; nothing
+            // to tap means free text.
+            return optionCount >= 2 ? .singleChoice : .freeText
+        }
+        let normalized = string
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: " ", with: "")
+        for candidate in ClarifyingQuestionKind.allCases where candidate.rawValue.lowercased() == normalized {
+            return candidate
+        }
+        switch normalized {
+        case "numeric", "number", "measurement", "weight", "quantity":
+            return .numericMeasurement
+        case "choice", "select", "multiplechoice", "options", "singleselect":
+            return .singleChoice
+        case "boolean", "bool", "yesno", "confirm":
+            return .yesNo
+        case "text", "open", "openended", "input":
+            return .freeText
+        case "photo", "image", "addphoto", "requestphoto":
+            return .requestAdditionalPhoto
+        default:
+            return optionCount >= 2 ? .singleChoice : .freeText
+        }
+    }
+}
+
 /// A short question the model wants answered before it commits to a number,
 /// e.g. "Grilled or fried?". Pre-log only — never persisted on a logged entry.
+///
+/// `id` is a string rather than a generated UUID because it has to survive the
+/// round trip through the model: the follow-up analysis is given the first pass's
+/// JSON back, and answers are matched to questions by this id.
 struct ClarifyingQuestion: Identifiable, Codable, Hashable {
-    var id: UUID
+    var id: String
+    var kind: ClarifyingQuestionKind
     var question: String
+    /// Choices for `singleChoice`. Empty for every other kind.
     var options: [String]
+    /// Why this is being asked, e.g. "Oil is the largest source of uncertainty."
+    /// Shown to the user: a question that explains itself gets answered more often
+    /// than one that just interrogates.
+    var reason: String?
+    /// Components this question would change, by their stable ids.
+    var relatedItemIDs: [String]
+    /// Suggested unit for `numericMeasurement`, e.g. "g" or "ml".
+    var suggestedUnit: String?
+    /// For `requestAdditionalPhoto`: what the photo should show.
+    var requestedPhotoKind: PhotoEvidenceKind?
 
-    init(id: UUID = UUID(), question: String, options: [String]) {
+    init(
+        id: String = UUID().uuidString,
+        kind: ClarifyingQuestionKind = .singleChoice,
+        question: String,
+        options: [String] = [],
+        reason: String? = nil,
+        relatedItemIDs: [String] = [],
+        suggestedUnit: String? = nil,
+        requestedPhotoKind: PhotoEvidenceKind? = nil
+    ) {
         self.id = id
+        self.kind = kind
         self.question = question
         self.options = options
+        self.reason = reason
+        self.relatedItemIDs = relatedItemIDs
+        self.suggestedUnit = suggestedUnit
+        self.requestedPhotoKind = requestedPhotoKind
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, kind, question, options, reason, relatedItemIDs, suggestedUnit, requestedPhotoKind
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // Entries written before ids were stable stored a UUID; either decodes as
+        // a string here, so no migration is needed.
+        if let string = try? container.decode(String.self, forKey: .id) {
+            id = string
+        } else if let uuid = try? container.decode(UUID.self, forKey: .id) {
+            id = uuid.uuidString
+        } else {
+            id = UUID().uuidString
+        }
+        question = try container.decodeIfPresent(String.self, forKey: .question) ?? ""
+        options = try container.decodeIfPresent([String].self, forKey: .options) ?? []
+        kind = try container.decodeIfPresent(ClarifyingQuestionKind.self, forKey: .kind)
+            ?? (options.count >= 2 ? .singleChoice : .freeText)
+        reason = try container.decodeIfPresent(String.self, forKey: .reason)
+        relatedItemIDs = try container.decodeIfPresent([String].self, forKey: .relatedItemIDs) ?? []
+        suggestedUnit = try container.decodeIfPresent(String.self, forKey: .suggestedUnit)
+        requestedPhotoKind = try container.decodeIfPresent(PhotoEvidenceKind.self, forKey: .requestedPhotoKind)
+    }
+
+    /// Whether the question is answerable as presented. A choice question with
+    /// nothing to choose between is a dead end and should never reach the UI.
+    var isRenderable: Bool {
+        guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        switch kind {
+        case .singleChoice: return options.count >= 2
+        case .yesNo, .numericMeasurement, .freeText, .requestAdditionalPhoto: return true
+        }
+    }
+
+    /// An empty answer shell, so the UI can bind to something before the user acts.
+    func emptyAnswer() -> ClarificationAnswer {
+        ClarificationAnswer(questionID: id, kind: kind, questionText: question, unit: suggestedUnit)
     }
 }
 
 /// Everything the analysis knows beyond a single flat number: what the plate is
 /// made of, how wide the real answer could be, and what it had to assume.
+/// Where an analysis sits in the two-stage flow.
+enum MealAnalysisStatus: String, Codable, CaseIterable, Hashable {
+    /// A first estimate the model is content with.
+    case provisional
+    /// A first estimate with questions outstanding that would materially improve it.
+    case needsClarification
+    /// Settled — either the questions were answered, or the user chose to skip them.
+    case final
+}
+
 struct MealAnalysisDetail: Codable, Hashable {
+    var status: MealAnalysisStatus
+    /// The dish as a whole, e.g. "Chicken, rice and yogurt". The components name
+    /// the parts; this names the meal.
+    var mealName: String?
     var components: [MealComponent]
     var calorieRange: CalorieRange?
     var confidence: ConfidenceScore?
     var assumptions: [String]
     var questions: [ClarifyingQuestion]
+    /// Answers the user gave. Kept after logging — they explain why the numbers
+    /// are what they are, and they are the record of what the user actually knew.
+    var answers: [ClarificationAnswer]
+    /// The one or two things that would most change the answer if known. Shown
+    /// instead of a bare confidence percentage, which tells the user nothing
+    /// actionable.
+    var majorUncertainties: [String]
+    var provenance: AnalysisProvenance?
 
     init(
+        status: MealAnalysisStatus = .provisional,
+        mealName: String? = nil,
         components: [MealComponent] = [],
         calorieRange: CalorieRange? = nil,
         confidence: ConfidenceScore? = nil,
         assumptions: [String] = [],
-        questions: [ClarifyingQuestion] = []
+        questions: [ClarifyingQuestion] = [],
+        answers: [ClarificationAnswer] = [],
+        majorUncertainties: [String] = [],
+        provenance: AnalysisProvenance? = nil
     ) {
+        self.status = status
+        self.mealName = mealName
         self.components = components
         self.calorieRange = calorieRange
         self.confidence = confidence
         self.assumptions = assumptions
         self.questions = questions
+        self.answers = answers
+        self.majorUncertainties = majorUncertainties
+        self.provenance = provenance
+    }
+
+    /// Questions worth putting in front of the user: renderable, not already
+    /// answered, and not asking about something the app already knows exactly.
+    func pendingQuestions() -> [ClarifyingQuestion] {
+        let answered = Set(answers.filter(\.isAnswered).map(\.questionID))
+        let exactComponentIDs = Set(components.filter(\.hasExactQuantity).map(\.stableID))
+        return questions.filter { question in
+            guard question.isRenderable, !answered.contains(question.id) else { return false }
+            // A weight question about a component that was weighed is noise.
+            if question.kind == .numericMeasurement,
+               !question.relatedItemIDs.isEmpty,
+               question.relatedItemIDs.allSatisfy({ exactComponentIDs.contains($0) }) {
+                return false
+            }
+            return true
+        }
+    }
+
+    var needsClarification: Bool { !pendingQuestions().isEmpty }
+
+    /// Calorie bounds summed from the components, which is more defensible than a
+    /// separately invented meal-level range: the parts are where the uncertainty
+    /// actually lives. Falls back to the model's own range when the components do
+    /// not carry one.
+    var derivedCalorieRange: CalorieRange? {
+        let ranges = components.compactMap(\.calorieRange)
+        guard !ranges.isEmpty, ranges.count == components.count else { return calorieRange }
+        let low = ranges.reduce(0) { $0 + $1.low }
+        let high = ranges.reduce(0) { $0 + $1.high }
+        let summed = CalorieRange(low: low, high: high)
+        return summed.isMeaningful ? summed : calorieRange
     }
 
     static let empty = MealAnalysisDetail()
@@ -220,10 +482,15 @@ struct MealAnalysisDetail: Codable, Hashable {
             && confidence == nil
             && assumptions.isEmpty
             && questions.isEmpty
+            && answers.isEmpty
+            && majorUncertainties.isEmpty
+            && provenance == nil
+            && (mealName ?? "").isEmpty
     }
 
     private enum CodingKeys: String, CodingKey {
         case components, calorieRange, confidence, assumptions, questions
+        case status, mealName, answers, majorUncertainties, provenance
     }
 
     init(from decoder: Decoder) throws {
@@ -233,6 +500,12 @@ struct MealAnalysisDetail: Codable, Hashable {
         confidence = try container.decodeIfPresent(ConfidenceScore.self, forKey: .confidence)
         assumptions = try container.decodeIfPresent([String].self, forKey: .assumptions) ?? []
         questions = try container.decodeIfPresent([ClarifyingQuestion].self, forKey: .questions) ?? []
+        // Anything already in the diary was settled by the act of logging it.
+        status = try container.decodeIfPresent(MealAnalysisStatus.self, forKey: .status) ?? .final
+        mealName = try container.decodeIfPresent(String.self, forKey: .mealName)
+        answers = try container.decodeIfPresent([ClarificationAnswer].self, forKey: .answers) ?? []
+        majorUncertainties = try container.decodeIfPresent([String].self, forKey: .majorUncertainties) ?? []
+        provenance = try container.decodeIfPresent(AnalysisProvenance.self, forKey: .provenance)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -242,6 +515,11 @@ struct MealAnalysisDetail: Codable, Hashable {
         try container.encodeIfPresent(confidence, forKey: .confidence)
         if !assumptions.isEmpty { try container.encode(assumptions, forKey: .assumptions) }
         if !questions.isEmpty { try container.encode(questions, forKey: .questions) }
+        if status != .final { try container.encode(status, forKey: .status) }
+        try container.encodeIfPresent(mealName, forKey: .mealName)
+        if !answers.isEmpty { try container.encode(answers, forKey: .answers) }
+        if !majorUncertainties.isEmpty { try container.encode(majorUncertainties, forKey: .majorUncertainties) }
+        try container.encodeIfPresent(provenance, forKey: .provenance)
     }
 
     var componentGrams: Double { components.reduce(0) { $0 + $1.grams } }
@@ -249,20 +527,42 @@ struct MealAnalysisDetail: Codable, Hashable {
 
     func scaled(by factor: Double) -> MealAnalysisDetail {
         guard factor.isFinite, factor > 0, factor != 1 else { return self }
-        return MealAnalysisDetail(
-            components: components.map { $0.scaled(by: factor) },
-            calorieRange: calorieRange?.scaled(by: factor),
-            confidence: confidence,
-            assumptions: assumptions,
-            questions: questions
-        )
+        var copy = self
+        copy.components = components.map { $0.scaled(by: factor) }
+        copy.calorieRange = calorieRange?.scaled(by: factor)
+        return copy
     }
 
-    /// Drops the pre-log question prompt. Questions describe a decision the user has
-    /// already made by the time the meal is in the diary.
+    /// Drops the pre-log question prompt and marks the analysis settled. Questions
+    /// describe a decision the user has already made by the time the meal is in the
+    /// diary; the answers are kept, because they explain the numbers.
     var withoutQuestions: MealAnalysisDetail {
         var copy = self
         copy.questions = []
+        copy.status = .final
+        return copy
+    }
+
+    /// Records that the user changed a value by hand. Weak evidence the estimate
+    /// was wrong, and the counterpart to leaving it untouched — together these are
+    /// what later makes per-model accuracy measurable.
+    func markingUserEdited() -> MealAnalysisDetail {
+        guard var existing = provenance else { return self }
+        guard !existing.userEdited else { return self }
+        existing.userEdited = true
+        var copy = self
+        copy.provenance = existing
+        return copy
+    }
+
+    /// Attaches the answers the user gave and settles the status.
+    func applying(answers newAnswers: [ClarificationAnswer]) -> MealAnalysisDetail {
+        var copy = self
+        let answered = newAnswers.filter(\.isAnswered)
+        var merged = answers.filter { existing in !answered.contains { $0.questionID == existing.questionID } }
+        merged.append(contentsOf: answered)
+        copy.answers = merged
+        copy.provenance?.answeredQuestionCount = merged.count
         return copy
     }
 
