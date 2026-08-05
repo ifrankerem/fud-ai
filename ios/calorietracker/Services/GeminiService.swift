@@ -1203,8 +1203,10 @@ struct GeminiService {
     }
 
     /// Reads the components / range / confidence / assumptions / questions block.
-    /// Every piece is optional: a provider that ignores the instruction still yields a
-    /// usable analysis, it just shows no breakdown.
+    ///
+    /// The parsing itself lives in `MealAnalysisResponseParser`, which understands
+    /// the fuller two-stage schema. This forwards to it so there is one parser
+    /// rather than two that drift apart, and so this file stops growing.
     static func parseMealDetail(
         from json: [String: Any],
         calories: Int,
@@ -1213,167 +1215,16 @@ struct GeminiService {
         fat: Double,
         servingSizeGrams: Double
     ) -> MealAnalysisDetail {
-        let components = parseComponents(
-            from: json["components"],
+        MealAnalysisResponseParser.parseDetail(
+            from: json,
             calories: calories,
             protein: protein,
             carbs: carbs,
             fat: fat,
             servingSizeGrams: servingSizeGrams
         )
-
-        var range = parseCalorieRange(from: json["calorie_range"] ?? json["calorieRange"])
-        // A range that excludes the point estimate is worse than no range at all.
-        if let existing = range, !existing.isMeaningful { range = nil }
-        if let existing = range, calories > 0 { range = existing.containing(calories) }
-
-        let assumptions = parseStringList(json["assumptions"], keys: ["text", "assumption", "note"], limit: 4, maxLength: 140)
-
-        return MealAnalysisDetail(
-            components: components,
-            calorieRange: range,
-            confidence: ConfidenceScore.parse(json["confidence"]),
-            assumptions: assumptions,
-            questions: parseClarifyingQuestions(from: json["questions"] ?? json["clarifying_questions"])
-        )
     }
 
-    private static func parseComponents(
-        from value: Any?,
-        calories: Int,
-        protein: Double,
-        carbs: Double,
-        fat: Double,
-        servingSizeGrams: Double
-    ) -> [MealComponent] {
-        guard let rawList = value as? [Any], !rawList.isEmpty else { return [] }
-
-        var components: [MealComponent] = []
-        for raw in rawList {
-            guard let item = raw as? [String: Any] else { continue }
-            guard let name = (item["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !name.isEmpty
-            else { continue }
-            let trimmedNote = (item["note"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let note: String? = (trimmedNote?.isEmpty ?? true) ? nil : String(trimmedNote!.prefix(80))
-            let component = MealComponent(
-                name: name,
-                grams: doubleValue(item["grams"]) ?? 0,
-                calories: Int((doubleValue(item["calories"]) ?? 0).rounded()),
-                protein: doubleValue(item["protein"]) ?? 0,
-                carbs: doubleValue(item["carbs"]) ?? 0,
-                fat: doubleValue(item["fat"]) ?? 0,
-                confidence: ConfidenceScore.parse(item["confidence"]),
-                isHidden: boolValue(item["hidden"] ?? item["is_hidden"]) ?? false,
-                note: note
-            )
-            components.append(component)
-            if components.count >= 12 { break }
-        }
-
-        // One component that simply restates the meal adds a row and no information.
-        guard components.count > 1 else { return [] }
-
-        var reconciled = MealAnalysisDetail.reconcile(
-            components,
-            toCalories: calories,
-            protein: protein,
-            carbs: carbs,
-            fat: fat
-        )
-
-        // Grams are their own axis — the model can nail the calories and still hand
-        // back parts that don't add up to the plate weight.
-        let gramTotal = reconciled.reduce(0.0) { $0 + $1.grams }
-        if gramTotal > 0, servingSizeGrams > 0 {
-            let factor = servingSizeGrams / gramTotal
-            if abs(factor - 1) > 0.02 {
-                for index in reconciled.indices {
-                    reconciled[index].grams *= factor
-                }
-            }
-        }
-        return reconciled
-    }
-
-    private static func parseCalorieRange(from value: Any?) -> CalorieRange? {
-        if let dictionary = value as? [String: Any] {
-            let low = doubleValue(dictionary["low"] ?? dictionary["min"])
-            let high = doubleValue(dictionary["high"] ?? dictionary["max"])
-            guard let low, let high else { return nil }
-            return CalorieRange(low: Int(low.rounded()), high: Int(high.rounded()))
-        }
-        if let pair = value as? [Any], pair.count == 2,
-           let low = doubleValue(pair[0]), let high = doubleValue(pair[1]) {
-            return CalorieRange(low: Int(low.rounded()), high: Int(high.rounded()))
-        }
-        // "620-760" / "620–760"
-        if let string = value as? String {
-            let parts = string
-                .replacingOccurrences(of: "–", with: "-")
-                .replacingOccurrences(of: "kcal", with: "")
-                .split(separator: "-")
-                .compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
-            if parts.count == 2 {
-                return CalorieRange(low: Int(parts[0].rounded()), high: Int(parts[1].rounded()))
-            }
-        }
-        return nil
-    }
-
-    private static func parseClarifyingQuestions(from value: Any?) -> [ClarifyingQuestion] {
-        guard let rawList = value as? [Any] else { return [] }
-        var questions: [ClarifyingQuestion] = []
-        for raw in rawList {
-            guard let item = raw as? [String: Any] else { continue }
-            guard let text = (item["question"] as? String ?? item["text"] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !text.isEmpty
-            else { continue }
-            // Deduped because the chips are keyed by their own text — a repeated
-            // option would collide and render unpredictably.
-            var seen = Set<String>()
-            let options = parseStringList(item["options"] ?? item["answers"], keys: ["text", "label"], limit: 6, maxLength: 40)
-                .filter { seen.insert($0.lowercased()).inserted }
-                .prefix(4)
-            // Without options there is nothing to tap, and a free-text prompt here
-            // would just be the context field the user already has.
-            guard options.count >= 2 else { continue }
-            questions.append(ClarifyingQuestion(question: text, options: Array(options)))
-            if questions.count >= 3 { break }
-        }
-        return questions
-    }
-
-    private static func parseStringList(_ value: Any?, keys: [String], limit: Int, maxLength: Int) -> [String] {
-        guard let rawList = value as? [Any] else { return [] }
-        var results: [String] = []
-        for raw in rawList {
-            var candidate: String?
-            if let string = raw as? String {
-                candidate = string
-            } else if let dictionary = raw as? [String: Any] {
-                candidate = keys.compactMap { dictionary[$0] as? String }.first
-            }
-            guard let text = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { continue }
-            results.append(String(text.prefix(maxLength)))
-            if results.count >= limit { break }
-        }
-        return results
-    }
-
-    private static func boolValue(_ value: Any?) -> Bool? {
-        if let flag = value as? Bool { return flag }
-        if let number = value as? NSNumber { return number.boolValue }
-        if let string = value as? String {
-            switch string.trimmingCharacters(in: .whitespaces).lowercased() {
-            case "true", "yes", "1": return true
-            case "false", "no", "0": return false
-            default: return nil
-            }
-        }
-        return nil
-    }
 
     private static func parseNutritionLabel(from text: String) throws -> NutritionLabelAnalysis {
         let jsonString = extractJSON(from: text)
