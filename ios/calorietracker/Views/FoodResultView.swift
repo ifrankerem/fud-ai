@@ -66,17 +66,27 @@ struct FoodResultView: View {
     @State private var mealConfidence: ConfidenceScore?
     @State private var assumptions: [String]
     @State private var clarifyingQuestions: [ClarifyingQuestion]
-    @State private var questionAnswers: [String: String] = [:]
+    @State private var questionAnswers: [String: ClarificationAnswer] = [:]
+    @State private var majorUncertainties: [String]
+    @State private var provenance: AnalysisProvenance?
     @State private var isRefining = false
+    /// Whether the questions are showing as a banner (collapsed) or expanded for
+    /// answering. Two modes of one screen rather than two screens: the content
+    /// overlap is near total, and keeping two nearly identical screens in step is
+    /// a maintenance trap.
+    @State private var isAnsweringQuestions = false
+    /// Set the moment the user changes any nutrition value. Weak evidence the
+    /// estimate was wrong, and the counterpart to leaving it untouched.
+    @State private var hasUserEdited = false
 
     let logDate: Date
     let profile: UserProfile
     let dayEntries: [FoodEntry]
     let weightMetric: Bool
     var onLog: (FoodEntry) -> Void
-    /// Re-runs the analysis with the user's answers folded into the context. Nil when
-    /// the caller has nothing to re-analyze (a barcode hit, a saved meal).
-    var onRefine: ((String) -> Void)?
+    /// Re-runs the analysis with the user's answers. Nil when the caller has
+    /// nothing to re-analyze (a barcode hit, a saved meal).
+    var onRefine: (([ClarificationAnswer]) -> Void)?
     @Environment(\.dismiss) private var dismiss
 
     // Scaling factor based on user-adjusted serving size
@@ -160,7 +170,7 @@ struct FoodResultView: View {
         dayEntries: [FoodEntry],
         weightMetric: Bool,
         onLog: @escaping (FoodEntry) -> Void,
-        onRefine: ((String) -> Void)? = nil
+        onRefine: (([ClarificationAnswer]) -> Void)? = nil
     ) {
         let normalizedServingUnitOptions = ServingUnitOption.normalizedOptions(servingUnitOptions, totalGrams: servingSizeGrams)
         let preferredServingUnit = FoodMeasurementSettings.preferGramsByDefault ? nil : selectedServingUnit
@@ -219,7 +229,13 @@ struct FoodResultView: View {
         self._baseCalorieRange = State(initialValue: analysisDetail.calorieRange)
         self._mealConfidence = State(initialValue: analysisDetail.confidence)
         self._assumptions = State(initialValue: analysisDetail.assumptions)
-        self._clarifyingQuestions = State(initialValue: analysisDetail.questions)
+        let pending = analysisDetail.pendingQuestions()
+        self._clarifyingQuestions = State(initialValue: pending)
+        self._questionAnswers = State(
+            initialValue: Dictionary(pending.map { ($0.id, $0.emptyAnswer()) }, uniquingKeysWith: { first, _ in first })
+        )
+        self._majorUncertainties = State(initialValue: analysisDetail.majorUncertainties)
+        self._provenance = State(initialValue: analysisDetail.provenance)
         self.logDate = logDate
         self.profile = profile
         self.dayEntries = dayEntries
@@ -258,6 +274,7 @@ struct FoodResultView: View {
     }
 
     private func updateBaseCalories(from text: String) {
+        noteUserEdit()
         let newValue = Int(round((decimalValue(from: text) ?? 0) / safeInverseScale))
         // Correcting the total has to move the parts too, or the breakdown below
         // would stop adding up to the number the user just typed.
@@ -266,18 +283,21 @@ struct FoodResultView: View {
     }
 
     private func updateBaseProtein(from text: String) {
+        noteUserEdit()
         let newValue = (decimalValue(from: text) ?? 0) / safeInverseScale
         distributeMacro(\.protein, from: editableProtein, to: newValue)
         editableProtein = newValue
     }
 
     private func updateBaseCarbs(from text: String) {
+        noteUserEdit()
         let newValue = (decimalValue(from: text) ?? 0) / safeInverseScale
         distributeMacro(\.carbs, from: editableCarbs, to: newValue)
         editableCarbs = newValue
     }
 
     private func updateBaseFat(from text: String) {
+        noteUserEdit()
         let newValue = (decimalValue(from: text) ?? 0) / safeInverseScale
         distributeMacro(\.fat, from: editableFat, to: newValue)
         editableFat = newValue
@@ -311,6 +331,7 @@ struct FoodResultView: View {
 
     private func editComponent(_ id: UUID, _ transform: (inout MealComponent) -> Void) {
         guard let index = editableComponents.firstIndex(where: { $0.id == id }) else { return }
+        noteUserEdit()
         let previousScale = scale
         let previousBaseGrams = baseServingSizeGrams
         transform(&editableComponents[index])
@@ -467,21 +488,28 @@ struct FoodResultView: View {
         }
     }
 
-    private var refinementSummary: String {
-        clarifyingQuestions
-            .compactMap { question in
-                guard let answer = questionAnswers[question.id] else { return nil }
-                return "\(question.question) \(answer)"
-            }
-            .joined(separator: " ")
+    private var collectedAnswers: [ClarificationAnswer] {
+        clarifyingQuestions.compactMap { questionAnswers[$0.id] }.filter(\.isAnswered)
     }
 
     private func submitRefinement() {
-        guard let onRefine else { return }
-        let summary = refinementSummary
-        guard !summary.isEmpty else { return }
+        guard let onRefine, !collectedAnswers.isEmpty else { return }
         isRefining = true
-        onRefine(summary)
+        onRefine(collectedAnswers)
+    }
+
+    /// The user chose the provisional estimate. Settle it here rather than asking
+    /// the caller to re-run anything — skipping must never cost a round trip.
+    private func skipQuestions() {
+        clarifyingQuestions = []
+        isAnsweringQuestions = false
+    }
+
+    /// Any manual change to a nutrition value marks the estimate as corrected.
+    /// Recorded once; the flag is about whether the user intervened at all.
+    private func noteUserEdit() {
+        guard !hasUserEdited else { return }
+        hasUserEdited = true
     }
 
     // MARK: - Sections
@@ -494,16 +522,18 @@ struct FoodResultView: View {
     /// everything below it.
     @ViewBuilder
     private var uncertaintySections: some View {
-        if displayedCalorieRange != nil || mealConfidence != nil {
+        if displayedCalorieRange != nil || mealConfidence != nil || !majorUncertainties.isEmpty {
             Section {
                 if let range = displayedCalorieRange {
                     CalorieRangeRow(range: range, confidence: mealConfidence)
-                } else if let confidence = mealConfidence {
-                    HStack {
-                        Text(LocalizedDisplayText.text("Confidence", polish: "Pewność"))
-                        Spacer()
-                        ConfidenceBadge(score: confidence)
-                    }
+                }
+                // Confidence alone is a number the user cannot act on; pairing it
+                // with what is actually unknown is what makes it useful.
+                if !majorUncertainties.isEmpty || displayedCalorieRange == nil {
+                    MajorUncertaintiesView(
+                        confidence: displayedCalorieRange == nil ? mealConfidence : nil,
+                        uncertainties: majorUncertainties
+                    )
                 }
             } header: {
                 Text(LocalizedDisplayText.text("Estimate", polish: "Szacunek"))
@@ -512,19 +542,54 @@ struct FoodResultView: View {
 
         if !clarifyingQuestions.isEmpty, onRefine != nil {
             Section {
-                ClarifyingQuestionsView(
-                    questions: clarifyingQuestions,
-                    answers: $questionAnswers,
-                    isRefining: isRefining,
-                    onRefine: submitRefinement
-                )
+                if isAnsweringQuestions {
+                    ForEach(clarifyingQuestions) { question in
+                        ClarificationQuestionRow(
+                            question: question,
+                            answer: Binding(
+                                get: { questionAnswers[question.id] ?? question.emptyAnswer() },
+                                set: { questionAnswers[question.id] = $0 }
+                            )
+                        )
+                    }
+                    HStack(spacing: 10) {
+                        Button(action: submitRefinement) {
+                            HStack(spacing: 6) {
+                                if isRefining { ProgressView().controlSize(.small) }
+                                Text(
+                                    isRefining
+                                        ? LocalizedDisplayText.text("Re-analyzing…", polish: "Ponowna analiza…")
+                                        : LocalizedDisplayText.text("Update estimate", polish: "Zaktualizuj szacunek")
+                                )
+                                .font(.system(.body, design: .rounded, weight: .semibold))
+                            }
+                        }
+                        .disabled(collectedAnswers.isEmpty || isRefining)
+                        .tint(AppColors.calorie)
+
+                        Spacer()
+
+                        Button(LocalizedDisplayText.text("Skip", polish: "Pomiń"), action: skipQuestions)
+                            .font(.system(.body, design: .rounded))
+                            .disabled(isRefining)
+                    }
+                } else {
+                    ProvisionalEstimateBanner(
+                        questionCount: clarifyingQuestions.count,
+                        isRefining: isRefining,
+                        onAnswer: { isAnsweringQuestions = true },
+                        onSkip: skipQuestions
+                    )
+                }
             } header: {
                 Text(LocalizedDisplayText.text("Help the estimate", polish: "Pomóż w szacunku"))
             } footer: {
-                Text(LocalizedDisplayText.text(
-                    "Answering runs the analysis again with your answers.",
-                    polish: "Odpowiedzi uruchamiają analizę ponownie."
-                ))
+                if isAnsweringQuestions {
+                    Text(LocalizedDisplayText.text(
+                        "Answer what you know. Anything you skip stays an estimate.",
+                        polish: "Odpowiedz na to, co wiesz. Reszta zostanie szacunkiem."
+                    ))
+                }
             }
         }
     }
@@ -555,7 +620,14 @@ struct FoodResultView: View {
                             let value = componentBaseValue(from: text)
                             editComponentValue(component.id) { $0.fat = value }
                         },
-                        onRemove: { removeComponent(component.id) }
+                        onRemove: { removeComponent(component.id) },
+                        onEditName: { newName in
+                            editComponentValue(component.id) { $0.name = newName }
+                        },
+                        onEditPreparation: { method in
+                            let trimmed = method.trimmingCharacters(in: .whitespacesAndNewlines)
+                            editComponentValue(component.id) { $0.preparationMethod = trimmed.isEmpty ? nil : trimmed }
+                        }
                     )
                 }
             } header: {
@@ -581,6 +653,7 @@ struct FoodResultView: View {
     }
 
     private func updateOptionalBaseDouble(from text: String, set: (Double?) -> Void) {
+        noteUserEdit()
         set(decimalValue(from: text).map { $0 / safeInverseScale })
     }
 
@@ -867,18 +940,26 @@ struct FoodResultView: View {
     /// user has answered them or decided not to — and the parts are reconciled against
     /// the totals actually being saved so the stored breakdown always adds up.
     private var loggedAnalysisDetail: MealAnalysisDetail {
-        MealAnalysisDetail(
+        var detail = MealAnalysisDetail(
+            status: .final,
             components: scaledComponents,
             calorieRange: displayedCalorieRange,
             confidence: mealConfidence,
-            assumptions: assumptions
+            assumptions: assumptions,
+            majorUncertainties: majorUncertainties,
+            provenance: provenance
         )
+        .applying(answers: collectedAnswers)
         .reconciled(
             toCalories: scaledCalories,
             protein: scaledProtein,
             carbs: scaledCarbs,
             fat: scaledFat
         )
+        if hasUserEdited {
+            detail = detail.markingUserEdited()
+        }
+        return detail
     }
 
 }

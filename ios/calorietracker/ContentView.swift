@@ -540,6 +540,9 @@ struct HomeView: View {
     @State private var lastAnalysisRequest: RetryRequest?
     /// Bumped per refinement so the result sheet rebuilds instead of reusing stale edits.
     @State private var refinementGeneration = 0
+    /// The two-stage result behind the sheet, kept so answering a question can be
+    /// folded into the estimate the user is looking at rather than a fresh one.
+    @State private var currentAnalysisOutcome: MealAnalysisOutcome?
     @State private var selectedDate: Date = .now
     @State private var showVoicePopover = false
     @State private var showTextPopover = false
@@ -1153,7 +1156,8 @@ struct HomeView: View {
                     AnalyzingView(image: nil, message: "Looking up barcode...")
                 case .foodResult:
                     if let result = currentFoodResult {
-                        let refineHandler: ((String) -> Void)? = lastAnalysisRequest == nil
+                        // Only offered when there is a two-stage outcome to refine.
+                        let refineHandler: (([ClarificationAnswer]) -> Void)? = currentAnalysisOutcome == nil
                             ? nil
                             : { answers in refineAnalysis(with: answers) }
                         FoodResultView(
@@ -1265,6 +1269,7 @@ struct HomeView: View {
                     // Re-logging a saved meal has no photo to re-analyze, so there is
                     // nothing for a follow-up question to act on.
                     lastAnalysisRequest = nil
+                    currentAnalysisOutcome = nil
                     activeSheet = .foodResult
                 })
             })
@@ -1385,27 +1390,43 @@ struct HomeView: View {
 
         Task {
             do {
-                switch mode {
-                case .snapFood:
-                    let result = try await GeminiService.analyzeFood(images: images)
-                    currentFoodResult = result
-                    currentFoodSource = .snapFood
-                    retryRequest = nil
-                    activeSheet = .foodResult
-
-                case .snapFoodWithContext:
-                    let result = try await GeminiService.analyzeFood(images: images, description: description)
-                    currentFoodResult = result
-                    currentFoodSource = .snapFood
-                    retryRequest = nil
-                    activeSheet = .foodResult
-
-                }
+                let outcome = try await analysisOutcome(
+                    images: images,
+                    mode: mode,
+                    description: description
+                )
+                currentAnalysisOutcome = outcome
+                currentFoodResult = outcome.analysis
+                currentFoodSource = .snapFood
+                retryRequest = nil
+                activeSheet = .foodResult
             } catch {
                 activeSheet = nil
                 errorMessage = error.localizedDescription
                 showError = true
             }
+        }
+    }
+
+    /// Runs the component-level two-stage analysis, falling back to the original
+    /// single-shot one if it fails.
+    ///
+    /// The fallback is the point: a breakdown with questions is an improvement on
+    /// a plain estimate, not a precondition for getting one. A provider that
+    /// cannot produce the richer schema should still let the user log their meal.
+    private func analysisOutcome(
+        images: [UIImage],
+        mode: CameraMode,
+        description: String?
+    ) async throws -> MealAnalysisOutcome {
+        let labelled = images.map { LabelledImage(image: $0, kind: .other) }
+        let note = mode == .snapFoodWithContext ? description : nil
+
+        do {
+            return try await MealAnalysisService().analyze(images: labelled, note: note)
+        } catch {
+            let analysis = try await GeminiService.analyzeFood(images: images, description: note)
+            return MealAnalysisOutcome(analysis: analysis, warnings: [])
         }
     }
 
@@ -1416,6 +1437,7 @@ struct HomeView: View {
         // A barcode result comes from a database, not a vision estimate — there is no
         // photo to re-read and no uncertainty for a question to resolve.
         lastAnalysisRequest = nil
+        currentAnalysisOutcome = nil
 
         currentImage = nil
         currentImages = []
@@ -1441,6 +1463,8 @@ struct HomeView: View {
     private func startTextAnalysis(_ description: String) {
         retryRequest = .text(description)
         lastAnalysisRequest = retryRequest
+        // Text entry has no photo to re-read; there is nothing a follow-up could see.
+        currentAnalysisOutcome = nil
         activeSheet = .analyzingText
         Task {
             do {
@@ -1457,29 +1481,41 @@ struct HomeView: View {
         }
     }
 
-    /// Re-runs the analysis behind the current result with the user's answers appended
-    /// to the context, then reopens the review sheet on the sharper estimate.
-    private func refineAnalysis(with answers: String) {
-        guard let lastAnalysisRequest else { return }
-        let trimmed = answers.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        refinementGeneration += 1
+    /// Folds the user's answers into the estimate on screen and reopens the sheet
+    /// on the sharper one.
+    ///
+    /// A failed refinement keeps the provisional estimate rather than dropping the
+    /// user back to nothing — they answered a question, they should not lose the
+    /// meal over it.
+    private func refineAnalysis(with answers: [ClarificationAnswer]) {
+        guard let previous = currentAnalysisOutcome,
+              let request = lastAnalysisRequest,
+              case let .analysis(images, mode, description) = request
+        else { return }
 
-        func merged(_ existing: String?) -> String {
-            guard let existing, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return trimmed
+        let labelled = images.map { LabelledImage(image: $0, kind: .other) }
+        let note = mode == .snapFoodWithContext ? description : nil
+        activeSheet = .analyzing
+
+        Task {
+            let refined: MealAnalysisOutcome
+            do {
+                refined = try await MealAnalysisService().refine(
+                    previous: previous,
+                    answers: answers,
+                    images: labelled,
+                    note: note
+                )
+            } catch {
+                // Settle what we already have instead of stranding the user.
+                refined = MealAnalysisService().skipping(previous, answers: answers)
+                errorMessage = error.localizedDescription
+                showError = true
             }
-            return "\(existing) \(trimmed)"
-        }
-
-        switch lastAnalysisRequest {
-        case let .analysis(images, _, description):
-            // Force the context-aware mode: the answers only help if they reach the prompt.
-            startAnalysis(images: images, mode: .snapFoodWithContext, description: merged(description))
-        case let .text(description):
-            startTextAnalysis(merged(description))
-        case .barcode:
-            break
+            refinementGeneration += 1
+            currentAnalysisOutcome = refined
+            currentFoodResult = refined.analysis
+            activeSheet = .foodResult
         }
     }
 
