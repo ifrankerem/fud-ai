@@ -706,6 +706,17 @@ struct GeminiService {
     }
 
     private static func callAI(prompt: String, images: [UIImage]) async throws -> String {
+        try await callAIReportingProvider(prompt: prompt, images: images).text
+    }
+
+    /// Same request, but says which provider actually answered.
+    ///
+    /// Meal analysis records provenance per entry, and a silent fallback means the
+    /// provider that answered is not the one that was selected — recording the
+    /// selected one would be wrong in exactly the cases that matter most for
+    /// judging a model. Kept as the single implementation so the fallback logic
+    /// does not exist twice.
+    static func callAIReportingProvider(prompt: String, images: [UIImage]) async throws -> AIRequestOutcome {
         let primaryProvider = AIProviderSettings.selectedProvider
         if primaryProvider.requiresAPIKey, AIProviderSettings.currentAPIKey == nil {
             throw AnalysisError.noAPIKey
@@ -715,14 +726,21 @@ struct GeminiService {
             try encodedJPEGData(for: $0)
         }
 
+        let primaryModel = AIProviderSettings.selectedModel
         do {
-            return try await dispatch(
+            let text = try await dispatch(
                 provider: primaryProvider,
-                model: AIProviderSettings.selectedModel,
+                model: primaryModel,
                 baseURL: AIProviderSettings.currentBaseURL,
                 apiKey: AIProviderSettings.currentAPIKey,
                 prompt: prompt,
                 imageDataList: imageDataList
+            )
+            return AIRequestOutcome(
+                text: text,
+                providerName: primaryProvider.rawValue,
+                model: primaryModel,
+                usedFallback: false
             )
         } catch {
             // imageConversionFailed is local — fallback won't help, rethrow.
@@ -731,13 +749,19 @@ struct GeminiService {
             guard let fallback = AIProviderSettings.currentFallbackConfig(excludingPrimary: primaryProvider) else {
                 throw error
             }
-            return try await dispatch(
+            let text = try await dispatch(
                 provider: fallback.provider,
                 model: fallback.model,
                 baseURL: fallback.baseURL,
                 apiKey: fallback.apiKey,
                 prompt: prompt,
                 imageDataList: imageDataList
+            )
+            return AIRequestOutcome(
+                text: text,
+                providerName: fallback.provider.rawValue,
+                model: fallback.model,
+                usedFallback: true
             )
         }
     }
@@ -1108,7 +1132,7 @@ struct GeminiService {
 
     // MARK: - Parsing (unchanged)
 
-    private static func extractJSON(from text: String) -> String {
+    static func extractJSON(from text: String) -> String {
         var cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let openFence = cleaned.range(of: "```json", options: .caseInsensitive)
@@ -1146,7 +1170,9 @@ struct GeminiService {
         return cleaned
     }
 
-    private static func parseFoodAnalysis(from text: String) throws -> FoodAnalysis {
+    /// Internal so MealAnalysisService can reuse the nutrient parsing instead of
+    /// duplicating 25 optional-micronutrient fields.
+    static func parseFoodAnalysis(from text: String) throws -> FoodAnalysis {
         let jsonString = extractJSON(from: text)
         guard let data = jsonString.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
