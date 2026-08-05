@@ -290,6 +290,9 @@ struct FoodEntry: Identifiable, Codable {
     var selectedServingUnit: String?
     var selectedServingQuantity: Double?
     var customNote: String?
+    /// Plate breakdown, calorie bounds, confidence and assumptions from the analysis.
+    /// Empty for manual entries and for anything logged before this existed.
+    var analysisDetail: MealAnalysisDetail
 
     nonisolated init(
         id: UUID = UUID(),
@@ -332,7 +335,8 @@ struct FoodEntry: Identifiable, Codable {
         servingUnitOptions: [ServingUnitOption] = [],
         selectedServingUnit: String? = nil,
         selectedServingQuantity: Double? = nil,
-        customNote: String? = nil
+        customNote: String? = nil,
+        analysisDetail: MealAnalysisDetail = .empty
     ) {
         self.id = id
         self.name = name
@@ -375,6 +379,7 @@ struct FoodEntry: Identifiable, Codable {
         self.selectedServingUnit = selectedServingUnit
         self.selectedServingQuantity = selectedServingQuantity
         self.customNote = customNote
+        self.analysisDetail = analysisDetail
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -390,6 +395,7 @@ struct FoodEntry: Identifiable, Codable {
         case vitaminA, vitaminC, vitaminD, vitaminB12, vitaminE, vitaminK, folate, omega3
         case servingSizeGrams
         case servingUnitOptions, selectedServingUnit, selectedServingQuantity, customNote
+        case analysisDetail
     }
 
     private static func decodeDouble(
@@ -460,6 +466,9 @@ struct FoodEntry: Identifiable, Codable {
         selectedServingUnit = try container.decodeIfPresent(String.self, forKey: .selectedServingUnit)
         selectedServingQuantity = try container.decodeIfPresent(Double.self, forKey: .selectedServingQuantity)
         customNote = try container.decodeIfPresent(String.self, forKey: .customNote)
+        // A malformed detail blob must not cost the user the whole diary row, so a
+        // decode failure degrades to "no breakdown" instead of throwing.
+        analysisDetail = (try? container.decodeIfPresent(MealAnalysisDetail.self, forKey: .analysisDetail)) ?? .empty
     }
 
     func encode(to encoder: Encoder) throws {
@@ -509,6 +518,9 @@ struct FoodEntry: Identifiable, Codable {
         try container.encodeIfPresent(selectedServingUnit, forKey: .selectedServingUnit)
         try container.encodeIfPresent(selectedServingQuantity, forKey: .selectedServingQuantity)
         try container.encodeIfPresent(customNote, forKey: .customNote)
+        if !analysisDetail.isEmpty {
+            try container.encode(analysisDetail, forKey: .analysisDetail)
+        }
     }
 
     var timeString: String {
@@ -572,7 +584,8 @@ struct FoodEntry: Identifiable, Codable {
             servingUnitOptions: servingUnitOptions,
             selectedServingUnit: selectedServingUnit,
             selectedServingQuantity: selectedServingQuantity,
-            customNote: customNote
+            customNote: customNote,
+            analysisDetail: analysisDetail
         )
     }
 }

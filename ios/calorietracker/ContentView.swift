@@ -534,6 +534,12 @@ struct HomeView: View {
         case barcode(String)
     }
     @State private var retryRequest: RetryRequest?
+    /// The analysis behind the result currently on screen. Unlike `retryRequest` this
+    /// survives success, because answering a clarifying question means re-running a
+    /// request that already worked.
+    @State private var lastAnalysisRequest: RetryRequest?
+    /// Bumped per refinement so the result sheet rebuilds instead of reusing stale edits.
+    @State private var refinementGeneration = 0
     @State private var selectedDate: Date = .now
     @State private var showVoicePopover = false
     @State private var showTextPopover = false
@@ -1147,6 +1153,9 @@ struct HomeView: View {
                     AnalyzingView(image: nil, message: "Looking up barcode...")
                 case .foodResult:
                     if let result = currentFoodResult {
+                        let refineHandler: ((String) -> Void)? = lastAnalysisRequest == nil
+                            ? nil
+                            : { answers in refineAnalysis(with: answers) }
                         FoodResultView(
                             images: currentImages,
                             emoji: currentEmoji,
@@ -1182,14 +1191,19 @@ struct HomeView: View {
                             servingUnitOptions: result.servingUnitOptions,
                             selectedServingUnit: result.selectedServingUnit,
                             selectedServingQuantity: result.selectedServingQuantity,
+                            analysisDetail: result.analysisDetail,
                             logDate: logDateForSelectedDay,
                             profile: userProfile,
                             dayEntries: foodStore.entries(for: logDateForSelectedDay),
                             weightMetric: weightUnitRaw == "kg",
                             onLog: { entry in
                                 foodStore.addEntry(entry)
-                            }
+                            },
+                            onRefine: refineHandler
                         )
+                        // A refined result is a different analysis; without a distinct
+                        // identity SwiftUI keeps the old view's edit state.
+                        .id(refinementGeneration)
                     }
                 case .editFood:
                     if let editingEntry {
@@ -1245,8 +1259,12 @@ struct HomeView: View {
                         omega3: entry.omega3,
                         servingUnitOptions: entry.servingUnitOptions,
                         selectedServingUnit: entry.selectedServingUnit,
-                        selectedServingQuantity: entry.selectedServingQuantity
+                        selectedServingQuantity: entry.selectedServingQuantity,
+                        analysisDetail: entry.analysisDetail
                     )
+                    // Re-logging a saved meal has no photo to re-analyze, so there is
+                    // nothing for a follow-up question to act on.
+                    lastAnalysisRequest = nil
                     activeSheet = .foodResult
                 })
             })
@@ -1362,6 +1380,7 @@ struct HomeView: View {
 
     private func startAnalysis(images: [UIImage], mode: CameraMode, description: String? = nil) {
         retryRequest = .analysis(images: images, mode: mode, description: description)
+        lastAnalysisRequest = retryRequest
         activeSheet = .analyzing
 
         Task {
@@ -1394,6 +1413,9 @@ struct HomeView: View {
         let trimmedBarcode = barcode.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedBarcode.isEmpty else { return }
         retryRequest = .barcode(trimmedBarcode)
+        // A barcode result comes from a database, not a vision estimate — there is no
+        // photo to re-read and no uncertainty for a question to resolve.
+        lastAnalysisRequest = nil
 
         currentImage = nil
         currentImages = []
@@ -1418,6 +1440,7 @@ struct HomeView: View {
 
     private func startTextAnalysis(_ description: String) {
         retryRequest = .text(description)
+        lastAnalysisRequest = retryRequest
         activeSheet = .analyzingText
         Task {
             do {
@@ -1431,6 +1454,32 @@ struct HomeView: View {
                 errorMessage = error.localizedDescription
                 showError = true
             }
+        }
+    }
+
+    /// Re-runs the analysis behind the current result with the user's answers appended
+    /// to the context, then reopens the review sheet on the sharper estimate.
+    private func refineAnalysis(with answers: String) {
+        guard let lastAnalysisRequest else { return }
+        let trimmed = answers.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        refinementGeneration += 1
+
+        func merged(_ existing: String?) -> String {
+            guard let existing, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return trimmed
+            }
+            return "\(existing) \(trimmed)"
+        }
+
+        switch lastAnalysisRequest {
+        case let .analysis(images, _, description):
+            // Force the context-aware mode: the answers only help if they reach the prompt.
+            startAnalysis(images: images, mode: .snapFoodWithContext, description: merged(description))
+        case let .text(description):
+            startTextAnalysis(merged(description))
+        case .barcode:
+            break
         }
     }
 

@@ -35,6 +35,9 @@ struct GeminiService {
         var servingUnitOptions: [ServingUnitOption] = []
         var selectedServingUnit: String?
         var selectedServingQuantity: Double?
+        /// Plate breakdown, calorie bounds, confidence, assumptions and follow-up
+        /// questions. Empty when the provider ignored the request for them.
+        var analysisDetail: MealAnalysisDetail = .empty
     }
 
     struct NutritionLabelAnalysis {
@@ -102,7 +105,10 @@ struct GeminiService {
                 omega3: omega3Per100g.map { round($0 * scale * 10) / 10 },
                 servingUnitOptions: servingUnitOptions,
                 selectedServingUnit: selectedOption?.unit,
-                selectedServingQuantity: selectedOption?.quantity(for: grams)
+                selectedServingQuantity: selectedOption?.quantity(for: grams),
+                // A printed label is a measurement, not a guess: no component
+                // breakdown to make and nothing to bracket with a range.
+                analysisDetail: MealAnalysisDetail(confidence: ConfidenceScore(level: .high))
             )
         }
     }
@@ -158,11 +164,27 @@ struct GeminiService {
     }
 
     private static let foodAnalysisJSONShape = """
-    {"name":"...","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"serving_size_grams":0.0,"emoji":"🍽️","sugar":0.0,"added_sugar":0.0,"fiber":0.0,"saturated_fat":0.0,"monounsaturated_fat":0.0,"polyunsaturated_fat":0.0,"trans_fat":0.0,"cholesterol":0.0,"sodium":0.0,"potassium":0.0,"calcium":0.0,"iron":0.0,"magnesium":0.0,"zinc":0.0,"vitamin_a":0.0,"vitamin_c":0.0,"vitamin_d":0.0,"vitamin_b12":0.0,"vitamin_e":0.0,"vitamin_k":0.0,"folate":0.0,"omega_3":0.0,"unit_options":[]}
+    {"name":"...","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"serving_size_grams":0.0,"emoji":"🍽️","sugar":0.0,"added_sugar":0.0,"fiber":0.0,"saturated_fat":0.0,"monounsaturated_fat":0.0,"polyunsaturated_fat":0.0,"trans_fat":0.0,"cholesterol":0.0,"sodium":0.0,"potassium":0.0,"calcium":0.0,"iron":0.0,"magnesium":0.0,"zinc":0.0,"vitamin_a":0.0,"vitamin_c":0.0,"vitamin_d":0.0,"vitamin_b12":0.0,"vitamin_e":0.0,"vitamin_k":0.0,"folate":0.0,"omega_3":0.0,"unit_options":[],"components":[],"calorie_range":{"low":0,"high":0},"confidence":"medium","assumptions":[],"questions":[]}
     """
 
     private static let foodAnalysisJSONShapeWithoutEmoji = """
-    {"name":"...","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"serving_size_grams":0.0,"sugar":0.0,"added_sugar":0.0,"fiber":0.0,"saturated_fat":0.0,"monounsaturated_fat":0.0,"polyunsaturated_fat":0.0,"trans_fat":0.0,"cholesterol":0.0,"sodium":0.0,"potassium":0.0,"calcium":0.0,"iron":0.0,"magnesium":0.0,"zinc":0.0,"vitamin_a":0.0,"vitamin_c":0.0,"vitamin_d":0.0,"vitamin_b12":0.0,"vitamin_e":0.0,"vitamin_k":0.0,"folate":0.0,"omega_3":0.0,"unit_options":[]}
+    {"name":"...","calories":0,"protein":0.0,"carbs":0.0,"fat":0.0,"serving_size_grams":0.0,"sugar":0.0,"added_sugar":0.0,"fiber":0.0,"saturated_fat":0.0,"monounsaturated_fat":0.0,"polyunsaturated_fat":0.0,"trans_fat":0.0,"cholesterol":0.0,"sodium":0.0,"potassium":0.0,"calcium":0.0,"iron":0.0,"magnesium":0.0,"zinc":0.0,"vitamin_a":0.0,"vitamin_c":0.0,"vitamin_d":0.0,"vitamin_b12":0.0,"vitamin_e":0.0,"vitamin_k":0.0,"folate":0.0,"omega_3":0.0,"unit_options":[],"components":[],"calorie_range":{"low":0,"high":0},"confidence":"medium","assumptions":[],"questions":[]}
+    """
+
+    /// Asks for the breakdown + uncertainty payload. Appended to every food analysis
+    /// prompt (not to nutrition labels, where the numbers are printed on the package).
+    private static let mealDetailInstruction = """
+    Also report HOW you arrived at the numbers, using these five keys:
+
+    - "components": split the meal into the parts you can see or must infer — e.g. grilled chicken, rice, salad, sauce, cooking oil. Each part is {"name":"Rice","grams":180,"calories":234,"protein":4.3,"carbs":51.0,"fat":0.5,"confidence":"medium","hidden":false,"note":"steamed, no butter"}.
+      * The parts' grams must add up to serving_size_grams, and their calories/protein/carbs/fat must add up to the meal totals.
+      * Use a single component only when the food genuinely is one item, like an apple or a can of cola. A plated meal normally has 2-6.
+      * Set "hidden": true for calories the photo does not show directly — cooking oil, butter, dressing, sauce, syrup, frying fat, sugar in a drink. List them as their own component even when you are only inferring them.
+      * "confidence" per part is "low", "medium" or "high". "note" is optional and under 60 characters.
+    - "calorie_range": realistic low/high bounds for the whole meal, as integers, with low < calories < high. Widen it when the cooking method, the amount of oil, or the depth of the portion is unclear; tighten it when a label, a kitchen scale, or a packaged item is visible. Never return a token range like calories plus or minus 1.
+    - "confidence": "low", "medium" or "high" for the meal overall. Use "low" when identification or portion is a guess, "high" only when both are clear.
+    - "assumptions": the 1-4 assumptions that move the calorie number the most, each a short string under 80 characters, e.g. "Assumed about 10 g of oil in the rice", "Assumed grilled rather than fried", "Assumed a standard 26 cm dinner plate". Return [] only when nothing meaningful was assumed.
+    - "questions": up to 3 short questions whose answers would most reduce the error, each {"question":"Grilled or fried?","options":["Grilled","Fried"]} with 2-4 options. Ask only when the answer would actually change the estimate. Return [] when you are confident.
     """
 
     private static let nutritionLabelJSONShape = """
@@ -251,6 +273,8 @@ struct GeminiService {
         The [] in unit_options above is only a JSON shape placeholder; replace it with options when a non-gram unit is obvious.
         unit_options is required when the text names an obvious non-gram serving unit, and optional otherwise. Use slice/piece for pizza, cake, bread, cookies, fruit pieces, etc.; use ml/cup/fl oz for drinks, milk, soup, smoothies, sauces, etc.; use tbsp/tsp for spooned foods; use can/packet when packaged. Its quantity must describe the whole analyzed amount, not always 1. Do not copy any sample number; use the quantity stated or clearly implied by the meal. Use [] only when no non-gram unit is apparent. Do not include g/grams in unit_options.
         Include a single food emoji that best represents the food. Use null for any nutrient you cannot estimate.
+
+        \(Self.mealDetailInstruction)
         """
         do {
             let analysis = try await callTextFoodAnalysis(prompt: prompt)
@@ -276,6 +300,9 @@ struct GeminiService {
         The [] in unit_options above is only a JSON shape placeholder; replace it with options when a non-gram unit is obvious.
         unit_options is required for obvious non-gram units visible in the image or label. Use slice/piece for pizza, cake, bread, cookies, fruit pieces, etc.; use ml/cup/fl oz for drinks, milk, soup, smoothies, sauces, etc.; use tbsp/tsp for spooned foods; use can/packet when packaged. Its quantity must describe the whole analyzed amount, not always 1. For a whole or mostly-whole divisible food like cake, pie, or pizza, count the visible pieces/slices and derive grams_per_unit from serving_size_grams / quantity. If N slices are visible, return quantity N. Use quantity 1 only when a single piece/slice is actually the analyzed portion. Use [] only when no non-gram unit is apparent. Do not include g/grams in unit_options.
         Use null for any nutrient you cannot estimate.
+
+        \(Self.mealDetailInstruction)
+        If the image turns out to be a nutrition label rather than a plate, return [] for components and questions and use "high" confidence — the label is a measurement, not an estimate.
         """
         let text = try await callAI(prompt: prompt, image: image)
         let analysis = try parseFoodAnalysis(from: text)
@@ -293,6 +320,8 @@ struct GeminiService {
         The [] in unit_options above is only a JSON shape placeholder; replace it with options when a non-gram unit is obvious.
         unit_options is required for obvious non-gram units visible in the food. Use slice/piece for pizza, cake, bread, cookies, fruit pieces, etc.; use ml/cup/fl oz for drinks, milk, soup, smoothies, sauces, etc.; use tbsp/tsp for spooned foods; use can/packet when packaged. Its quantity must describe the whole analyzed amount, not always 1. For a whole or mostly-whole divisible food like cake, pie, or pizza, count the visible pieces/slices and derive grams_per_unit from serving_size_grams / quantity. If N slices are visible, return quantity N. Use quantity 1 only when a single piece/slice is actually the analyzed portion. Use [] only when no non-gram unit is apparent. Do not include g/grams in unit_options.
         Give your best estimate for the visible food amount shown in the image. For whole/mostly-whole cakes, pizzas, pies, loaves, or similar foods, estimate the total visible item/remaining item weight rather than defaulting to one slice. Use null for any nutrient you cannot estimate.
+
+        \(Self.mealDetailInstruction)
         """
 
         if let description, !description.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -319,6 +348,9 @@ struct GeminiService {
         The [] in unit_options above is only a JSON shape placeholder; replace it with options when a non-gram unit is obvious.
         unit_options is required for obvious non-gram units visible in the food or label. Use slice/piece for pizza, cake, bread, cookies, fruit pieces, etc.; use ml/cup/fl oz for drinks, milk, soup, smoothies, sauces, etc.; use tbsp/tsp for spooned foods; use can/packet/bar when packaged. Its quantity must describe the whole analyzed amount, not always 1. Use [] only when no non-gram unit is apparent. Do not include g/grams in unit_options.
         Give your best estimate for the actual amount shown or implied across the images. Use null for any nutrient you cannot estimate.
+
+        \(Self.mealDetailInstruction)
+        Base the components on the whole image set combined, not on any single photo. When a scale reading or a label pins down part of the meal, mark that component "high" and narrow the overall range accordingly.
         """
 
         if let description, !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1158,8 +1190,189 @@ struct GeminiService {
             omega3: double("omega_3"),
             servingUnitOptions: unitOptions,
             selectedServingUnit: selectedOption?.unit,
-            selectedServingQuantity: selectedOption?.quantity(for: servingSizeGrams)
+            selectedServingQuantity: selectedOption?.quantity(for: servingSizeGrams),
+            analysisDetail: parseMealDetail(
+                from: json,
+                calories: calories,
+                protein: protein,
+                carbs: carbs,
+                fat: fat,
+                servingSizeGrams: servingSizeGrams
+            )
         )
+    }
+
+    /// Reads the components / range / confidence / assumptions / questions block.
+    /// Every piece is optional: a provider that ignores the instruction still yields a
+    /// usable analysis, it just shows no breakdown.
+    static func parseMealDetail(
+        from json: [String: Any],
+        calories: Int,
+        protein: Double,
+        carbs: Double,
+        fat: Double,
+        servingSizeGrams: Double
+    ) -> MealAnalysisDetail {
+        let components = parseComponents(
+            from: json["components"],
+            calories: calories,
+            protein: protein,
+            carbs: carbs,
+            fat: fat,
+            servingSizeGrams: servingSizeGrams
+        )
+
+        var range = parseCalorieRange(from: json["calorie_range"] ?? json["calorieRange"])
+        // A range that excludes the point estimate is worse than no range at all.
+        if let existing = range, !existing.isMeaningful { range = nil }
+        if let existing = range, calories > 0 { range = existing.containing(calories) }
+
+        let assumptions = parseStringList(json["assumptions"], keys: ["text", "assumption", "note"], limit: 4, maxLength: 140)
+
+        return MealAnalysisDetail(
+            components: components,
+            calorieRange: range,
+            confidence: ConfidenceScore.parse(json["confidence"]),
+            assumptions: assumptions,
+            questions: parseClarifyingQuestions(from: json["questions"] ?? json["clarifying_questions"])
+        )
+    }
+
+    private static func parseComponents(
+        from value: Any?,
+        calories: Int,
+        protein: Double,
+        carbs: Double,
+        fat: Double,
+        servingSizeGrams: Double
+    ) -> [MealComponent] {
+        guard let rawList = value as? [Any], !rawList.isEmpty else { return [] }
+
+        var components: [MealComponent] = []
+        for raw in rawList {
+            guard let item = raw as? [String: Any] else { continue }
+            guard let name = (item["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !name.isEmpty
+            else { continue }
+            let trimmedNote = (item["note"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let note: String? = (trimmedNote?.isEmpty ?? true) ? nil : String(trimmedNote!.prefix(80))
+            let component = MealComponent(
+                name: name,
+                grams: doubleValue(item["grams"]) ?? 0,
+                calories: Int((doubleValue(item["calories"]) ?? 0).rounded()),
+                protein: doubleValue(item["protein"]) ?? 0,
+                carbs: doubleValue(item["carbs"]) ?? 0,
+                fat: doubleValue(item["fat"]) ?? 0,
+                confidence: ConfidenceScore.parse(item["confidence"]),
+                isHidden: boolValue(item["hidden"] ?? item["is_hidden"]) ?? false,
+                note: note
+            )
+            components.append(component)
+            if components.count >= 12 { break }
+        }
+
+        // One component that simply restates the meal adds a row and no information.
+        guard components.count > 1 else { return [] }
+
+        var reconciled = MealAnalysisDetail.reconcile(
+            components,
+            toCalories: calories,
+            protein: protein,
+            carbs: carbs,
+            fat: fat
+        )
+
+        // Grams are their own axis — the model can nail the calories and still hand
+        // back parts that don't add up to the plate weight.
+        let gramTotal = reconciled.reduce(0.0) { $0 + $1.grams }
+        if gramTotal > 0, servingSizeGrams > 0 {
+            let factor = servingSizeGrams / gramTotal
+            if abs(factor - 1) > 0.02 {
+                for index in reconciled.indices {
+                    reconciled[index].grams *= factor
+                }
+            }
+        }
+        return reconciled
+    }
+
+    private static func parseCalorieRange(from value: Any?) -> CalorieRange? {
+        if let dictionary = value as? [String: Any] {
+            let low = doubleValue(dictionary["low"] ?? dictionary["min"])
+            let high = doubleValue(dictionary["high"] ?? dictionary["max"])
+            guard let low, let high else { return nil }
+            return CalorieRange(low: Int(low.rounded()), high: Int(high.rounded()))
+        }
+        if let pair = value as? [Any], pair.count == 2,
+           let low = doubleValue(pair[0]), let high = doubleValue(pair[1]) {
+            return CalorieRange(low: Int(low.rounded()), high: Int(high.rounded()))
+        }
+        // "620-760" / "620–760"
+        if let string = value as? String {
+            let parts = string
+                .replacingOccurrences(of: "–", with: "-")
+                .replacingOccurrences(of: "kcal", with: "")
+                .split(separator: "-")
+                .compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+            if parts.count == 2 {
+                return CalorieRange(low: Int(parts[0].rounded()), high: Int(parts[1].rounded()))
+            }
+        }
+        return nil
+    }
+
+    private static func parseClarifyingQuestions(from value: Any?) -> [ClarifyingQuestion] {
+        guard let rawList = value as? [Any] else { return [] }
+        var questions: [ClarifyingQuestion] = []
+        for raw in rawList {
+            guard let item = raw as? [String: Any] else { continue }
+            guard let text = (item["question"] as? String ?? item["text"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !text.isEmpty
+            else { continue }
+            // Deduped because the chips are keyed by their own text — a repeated
+            // option would collide and render unpredictably.
+            var seen = Set<String>()
+            let options = parseStringList(item["options"] ?? item["answers"], keys: ["text", "label"], limit: 6, maxLength: 40)
+                .filter { seen.insert($0.lowercased()).inserted }
+                .prefix(4)
+            // Without options there is nothing to tap, and a free-text prompt here
+            // would just be the context field the user already has.
+            guard options.count >= 2 else { continue }
+            questions.append(ClarifyingQuestion(question: text, options: Array(options)))
+            if questions.count >= 3 { break }
+        }
+        return questions
+    }
+
+    private static func parseStringList(_ value: Any?, keys: [String], limit: Int, maxLength: Int) -> [String] {
+        guard let rawList = value as? [Any] else { return [] }
+        var results: [String] = []
+        for raw in rawList {
+            var candidate: String?
+            if let string = raw as? String {
+                candidate = string
+            } else if let dictionary = raw as? [String: Any] {
+                candidate = keys.compactMap { dictionary[$0] as? String }.first
+            }
+            guard let text = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { continue }
+            results.append(String(text.prefix(maxLength)))
+            if results.count >= limit { break }
+        }
+        return results
+    }
+
+    private static func boolValue(_ value: Any?) -> Bool? {
+        if let flag = value as? Bool { return flag }
+        if let number = value as? NSNumber { return number.boolValue }
+        if let string = value as? String {
+            switch string.trimmingCharacters(in: .whitespaces).lowercased() {
+            case "true", "yes", "1": return true
+            case "false", "no", "0": return false
+            default: return nil
+            }
+        }
+        return nil
     }
 
     private static func parseNutritionLabel(from text: String) throws -> NutritionLabelAnalysis {

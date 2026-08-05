@@ -9,7 +9,13 @@ struct FoodResultView: View {
     let emoji: String?
     let source: FoodSource
 
-    let baseServingSizeGrams: Double
+    /// Grams the unscaled nutrition numbers refer to. Not a `let`: editing a component
+    /// changes how much food the meal actually is, and the portion scale the user
+    /// picked has to stay pinned across that change.
+    @State private var baseServingSizeGrams: Double
+    /// The model's own calorie figure, kept so the calorie range can follow a manual
+    /// correction instead of drifting away from the number on screen.
+    private let originalAnalysisCalories: Int
     let servingUnitOptions: [ServingUnitOption]
 
     @State var name: String
@@ -48,11 +54,29 @@ struct FoodResultView: View {
     @State private var showWhatIfSheet = false
     @State var mealType: MealType = .currentMeal
 
+    // Component breakdown + uncertainty. Components hold unscaled values, same as
+    // the `editable*` fields above; the portion scale is applied at render time.
+    @State private var editableComponents: [MealComponent]
+    /// Per-component snapshot used to derive calories-per-gram. The editor fires on
+    /// every keystroke, so scaling relative to the *previous* keystroke compounds
+    /// ("300" would apply the factor three times). Everything is recomputed from this
+    /// fixed reference instead, which stays correct no matter how the text is typed.
+    @State private var componentReference: [UUID: MealComponent]
+    @State private var baseCalorieRange: CalorieRange?
+    @State private var mealConfidence: ConfidenceScore?
+    @State private var assumptions: [String]
+    @State private var clarifyingQuestions: [ClarifyingQuestion]
+    @State private var questionAnswers: [UUID: String] = [:]
+    @State private var isRefining = false
+
     let logDate: Date
     let profile: UserProfile
     let dayEntries: [FoodEntry]
     let weightMetric: Bool
     var onLog: (FoodEntry) -> Void
+    /// Re-runs the analysis with the user's answers folded into the context. Nil when
+    /// the caller has nothing to re-analyze (a barcode hit, a saved meal).
+    var onRefine: ((String) -> Void)?
     @Environment(\.dismiss) private var dismiss
 
     // Scaling factor based on user-adjusted serving size
@@ -130,11 +154,13 @@ struct FoodResultView: View {
         servingUnitOptions: [ServingUnitOption] = [],
         selectedServingUnit: String? = nil,
         selectedServingQuantity: Double? = nil,
+        analysisDetail: MealAnalysisDetail = .empty,
         logDate: Date = .now,
         profile: UserProfile,
         dayEntries: [FoodEntry],
         weightMetric: Bool,
-        onLog: @escaping (FoodEntry) -> Void
+        onLog: @escaping (FoodEntry) -> Void,
+        onRefine: ((String) -> Void)? = nil
     ) {
         let normalizedServingUnitOptions = ServingUnitOption.normalizedOptions(servingUnitOptions, totalGrams: servingSizeGrams)
         let preferredServingUnit = FoodMeasurementSettings.preferGramsByDefault ? nil : selectedServingUnit
@@ -146,7 +172,8 @@ struct FoodResultView: View {
         self.images = images
         self.emoji = emoji
         self.source = source
-        self.baseServingSizeGrams = servingSizeGrams
+        self._baseServingSizeGrams = State(initialValue: servingSizeGrams)
+        self.originalAnalysisCalories = calories
         self.servingUnitOptions = normalizedServingUnitOptions
         self._name = State(initialValue: name)
         self._servingSizeGrams = State(initialValue: servingSizeGrams)
@@ -183,11 +210,22 @@ struct FoodResultView: View {
         self._editableVitaminK = State(initialValue: vitaminK)
         self._editableFolate = State(initialValue: folate)
         self._editableOmega3 = State(initialValue: omega3)
+        // Parts the model returned must already add up to the totals it returned;
+        // the parser reconciles them, so no second pass is needed here.
+        self._editableComponents = State(initialValue: analysisDetail.components)
+        self._componentReference = State(
+            initialValue: Dictionary(uniqueKeysWithValues: analysisDetail.components.map { ($0.id, $0) })
+        )
+        self._baseCalorieRange = State(initialValue: analysisDetail.calorieRange)
+        self._mealConfidence = State(initialValue: analysisDetail.confidence)
+        self._assumptions = State(initialValue: analysisDetail.assumptions)
+        self._clarifyingQuestions = State(initialValue: analysisDetail.questions)
         self.logDate = logDate
         self.profile = profile
         self.dayEntries = dayEntries
         self.weightMetric = weightMetric
         self.onLog = onLog
+        self.onRefine = onRefine
     }
 
     private static func formatGrams(_ value: Double) -> String {
@@ -220,11 +258,326 @@ struct FoodResultView: View {
     }
 
     private func updateBaseCalories(from text: String) {
-        editableCalories = Int(round((decimalValue(from: text) ?? 0) / safeInverseScale))
+        let newValue = Int(round((decimalValue(from: text) ?? 0) / safeInverseScale))
+        // Correcting the total has to move the parts too, or the breakdown below
+        // would stop adding up to the number the user just typed.
+        distributeCalories(to: newValue)
+        editableCalories = newValue
+    }
+
+    private func updateBaseProtein(from text: String) {
+        let newValue = (decimalValue(from: text) ?? 0) / safeInverseScale
+        distributeMacro(\.protein, from: editableProtein, to: newValue)
+        editableProtein = newValue
+    }
+
+    private func updateBaseCarbs(from text: String) {
+        let newValue = (decimalValue(from: text) ?? 0) / safeInverseScale
+        distributeMacro(\.carbs, from: editableCarbs, to: newValue)
+        editableCarbs = newValue
+    }
+
+    private func updateBaseFat(from text: String) {
+        let newValue = (decimalValue(from: text) ?? 0) / safeInverseScale
+        distributeMacro(\.fat, from: editableFat, to: newValue)
+        editableFat = newValue
     }
 
     private func updateBaseDouble(from text: String, set: (Double) -> Void) {
         set((decimalValue(from: text) ?? 0) / safeInverseScale)
+    }
+
+    // MARK: - Component breakdown
+
+    /// Components rendered at the portion the user selected.
+    private var scaledComponents: [MealComponent] {
+        editableComponents.map { $0.scaled(by: scale) }
+    }
+
+    /// The bounds were drawn around the model's original figure, so they follow both
+    /// the portion scale and any manual correction — otherwise the range would stop
+    /// bracketing the calorie number sitting right above it.
+    private var displayedCalorieRange: CalorieRange? {
+        guard let baseCalorieRange, baseCalorieRange.isMeaningful else { return nil }
+        let correction = originalAnalysisCalories > 0
+            ? Double(editableCalories) / Double(originalAnalysisCalories)
+            : 1
+        return baseCalorieRange.scaled(by: correction * scale).containing(scaledCalories)
+    }
+
+    private func componentBaseValue(from text: String) -> Double {
+        max(0, (decimalValue(from: text) ?? 0) / safeInverseScale)
+    }
+
+    private func editComponent(_ id: UUID, _ transform: (inout MealComponent) -> Void) {
+        guard let index = editableComponents.firstIndex(where: { $0.id == id }) else { return }
+        let previousScale = scale
+        let previousBaseGrams = baseServingSizeGrams
+        transform(&editableComponents[index])
+        editableComponents[index].clampToNonNegative()
+        syncTotalsFromComponents(previousScale: previousScale, previousBaseGrams: previousBaseGrams)
+    }
+
+    /// Changing how much of something there was has to change its calories too —
+    /// "that was 300 g of rice, not 200" is a statement about energy, not just weight.
+    /// Nutrition is re-derived from the reference snapshot's density.
+    private func editComponentGrams(_ id: UUID, text: String) {
+        let newGrams = componentBaseValue(from: text)
+        editComponent(id) { part in
+            guard let reference = componentReference[id], reference.grams > 0 else {
+                part.grams = newGrams
+                return
+            }
+            let factor = newGrams / reference.grams
+            part.grams = newGrams
+            part.calories = Int((Double(reference.calories) * factor).rounded())
+            part.protein = reference.protein * factor
+            part.carbs = reference.carbs * factor
+            part.fat = reference.fat * factor
+        }
+    }
+
+    /// A direct nutrition edit redefines the component's density, so it becomes the
+    /// new reference for any later gram change.
+    private func editComponentValue(_ id: UUID, _ apply: (inout MealComponent) -> Void) {
+        editComponent(id, apply)
+        if let updated = editableComponents.first(where: { $0.id == id }) {
+            componentReference[id] = updated
+        }
+    }
+
+    /// Correcting a meal total rewrites every component, which invalidates the density
+    /// snapshots the gram editor derives from.
+    private func refreshComponentReferences() {
+        for component in editableComponents {
+            componentReference[component.id] = component
+        }
+    }
+
+    private func removeComponent(_ id: UUID) {
+        // Dropping to zero components would leave the meal with no breakdown and no
+        // way to get one back, so the last one stays.
+        guard editableComponents.count > 1,
+              let index = editableComponents.firstIndex(where: { $0.id == id })
+        else { return }
+        let previousScale = scale
+        let previousBaseGrams = baseServingSizeGrams
+        editableComponents.remove(at: index)
+        componentReference[id] = nil
+        syncTotalsFromComponents(previousScale: previousScale, previousBaseGrams: previousBaseGrams)
+    }
+
+    /// Components are the source of truth once the user touches one: totals become
+    /// their sum, and the meal's weight becomes their combined grams.
+    private func syncTotalsFromComponents(previousScale: Double, previousBaseGrams: Double) {
+        guard !editableComponents.isEmpty else { return }
+        editableCalories = editableComponents.reduce(0) { $0 + $1.calories }
+        editableProtein = editableComponents.reduce(0) { $0 + $1.protein }
+        editableCarbs = editableComponents.reduce(0) { $0 + $1.carbs }
+        editableFat = editableComponents.reduce(0) { $0 + $1.fat }
+
+        let newBaseGrams = editableComponents.reduce(0) { $0 + $1.grams }
+        guard newBaseGrams > 0 else { return }
+
+        // Micronutrients are estimated for the meal as a whole rather than per
+        // component, so the only consistent response to "there was more rice" is to
+        // scale them with the new food amount.
+        if previousBaseGrams > 0, abs(newBaseGrams - previousBaseGrams) > 0.01 {
+            scaleOptionalNutrients(by: newBaseGrams / previousBaseGrams)
+        }
+
+        baseServingSizeGrams = newBaseGrams
+        servingSizeGrams = newBaseGrams * previousScale
+        servingSizeText = ServingUnitOption.initialQuantityText(
+            totalGrams: servingSizeGrams,
+            selectedUnitID: selectedServingUnitID,
+            selectedQuantity: nil,
+            options: servingUnitOptions
+        )
+    }
+
+    private func scaleOptionalNutrients(by factor: Double) {
+        guard factor.isFinite, factor > 0, factor != 1 else { return }
+        func scaled(_ value: Double?) -> Double? { value.map { $0 * factor } }
+        editableSugar = scaled(editableSugar)
+        editableAddedSugar = scaled(editableAddedSugar)
+        editableFiber = scaled(editableFiber)
+        editableSaturatedFat = scaled(editableSaturatedFat)
+        editableMonounsaturatedFat = scaled(editableMonounsaturatedFat)
+        editablePolyunsaturatedFat = scaled(editablePolyunsaturatedFat)
+        editableCholesterol = scaled(editableCholesterol)
+        editableSodium = scaled(editableSodium)
+        editablePotassium = scaled(editablePotassium)
+        editableTransFat = scaled(editableTransFat)
+        editableCalcium = scaled(editableCalcium)
+        editableIron = scaled(editableIron)
+        editableMagnesium = scaled(editableMagnesium)
+        editableZinc = scaled(editableZinc)
+        editableVitaminA = scaled(editableVitaminA)
+        editableVitaminC = scaled(editableVitaminC)
+        editableVitaminD = scaled(editableVitaminD)
+        editableVitaminB12 = scaled(editableVitaminB12)
+        editableVitaminE = scaled(editableVitaminE)
+        editableVitaminK = scaled(editableVitaminK)
+        editableFolate = scaled(editableFolate)
+        editableOmega3 = scaled(editableOmega3)
+    }
+
+    private func distributeCalories(to newTotal: Int) {
+        guard !editableComponents.isEmpty else { return }
+        defer { refreshComponentReferences() }
+        let current = editableComponents.reduce(0) { $0 + $1.calories }
+        guard current > 0 else {
+            let share = Int((Double(newTotal) / Double(editableComponents.count)).rounded())
+            for index in editableComponents.indices {
+                editableComponents[index].calories = max(0, share)
+            }
+            return
+        }
+        let factor = Double(newTotal) / Double(current)
+        for index in editableComponents.indices {
+            editableComponents[index].calories = max(0, Int((Double(editableComponents[index].calories) * factor).rounded()))
+        }
+        // Per-component rounding leaves a few kcal unaccounted for; park them on the
+        // largest part so the sum still equals what the user typed.
+        let drift = newTotal - editableComponents.reduce(0) { $0 + $1.calories }
+        if drift != 0,
+           let target = editableComponents.indices.max(by: { editableComponents[$0].calories < editableComponents[$1].calories }) {
+            editableComponents[target].calories = max(0, editableComponents[target].calories + drift)
+        }
+    }
+
+    private func distributeMacro(
+        _ keyPath: WritableKeyPath<MealComponent, Double>,
+        from oldTotal: Double,
+        to newTotal: Double
+    ) {
+        guard !editableComponents.isEmpty else { return }
+        defer { refreshComponentReferences() }
+        guard oldTotal > 0 else {
+            let share = newTotal / Double(editableComponents.count)
+            for index in editableComponents.indices {
+                editableComponents[index][keyPath: keyPath] = max(0, share)
+            }
+            return
+        }
+        let factor = newTotal / oldTotal
+        for index in editableComponents.indices {
+            editableComponents[index][keyPath: keyPath] = max(0, editableComponents[index][keyPath: keyPath] * factor)
+        }
+    }
+
+    private var refinementSummary: String {
+        clarifyingQuestions
+            .compactMap { question in
+                guard let answer = questionAnswers[question.id] else { return nil }
+                return "\(question.question) \(answer)"
+            }
+            .joined(separator: " ")
+    }
+
+    private func submitRefinement() {
+        guard let onRefine else { return }
+        let summary = refinementSummary
+        guard !summary.isEmpty else { return }
+        isRefining = true
+        onRefine(summary)
+    }
+
+    // MARK: - Sections
+    //
+    // Extracted rather than inlined: `List` takes at most 10 direct children in a
+    // ViewBuilder, and the body was already at six before any of this was added.
+
+    /// The honest-estimate header: how wide the answer really is, and the questions
+    /// that would narrow it. Placed above the numbers because answering one changes
+    /// everything below it.
+    @ViewBuilder
+    private var uncertaintySections: some View {
+        if displayedCalorieRange != nil || mealConfidence != nil {
+            Section {
+                if let range = displayedCalorieRange {
+                    CalorieRangeRow(range: range, confidence: mealConfidence)
+                } else if let confidence = mealConfidence {
+                    HStack {
+                        Text(LocalizedDisplayText.text("Confidence", polish: "Pewność"))
+                        Spacer()
+                        ConfidenceBadge(score: confidence)
+                    }
+                }
+            } header: {
+                Text(LocalizedDisplayText.text("Estimate", polish: "Szacunek"))
+            }
+        }
+
+        if !clarifyingQuestions.isEmpty, onRefine != nil {
+            Section {
+                ClarifyingQuestionsView(
+                    questions: clarifyingQuestions,
+                    answers: $questionAnswers,
+                    isRefining: isRefining,
+                    onRefine: submitRefinement
+                )
+            } header: {
+                Text(LocalizedDisplayText.text("Help the estimate", polish: "Pomóż w szacunku"))
+            } footer: {
+                Text(LocalizedDisplayText.text(
+                    "Answering runs the analysis again with your answers.",
+                    polish: "Odpowiedzi uruchamiają analizę ponownie."
+                ))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var componentsSection: some View {
+        if !editableComponents.isEmpty {
+            Section {
+                ForEach(scaledComponents) { component in
+                    MealComponentRow(
+                        component: component,
+                        onEditGrams: { text in
+                            editComponentGrams(component.id, text: text)
+                        },
+                        onEditCalories: { text in
+                            let value = componentBaseValue(from: text)
+                            editComponentValue(component.id) { $0.calories = Int(value.rounded()) }
+                        },
+                        onEditProtein: { text in
+                            let value = componentBaseValue(from: text)
+                            editComponentValue(component.id) { $0.protein = value }
+                        },
+                        onEditCarbs: { text in
+                            let value = componentBaseValue(from: text)
+                            editComponentValue(component.id) { $0.carbs = value }
+                        },
+                        onEditFat: { text in
+                            let value = componentBaseValue(from: text)
+                            editComponentValue(component.id) { $0.fat = value }
+                        },
+                        onRemove: { removeComponent(component.id) }
+                    )
+                }
+            } header: {
+                Text(LocalizedDisplayText.text("What's on the plate", polish: "Co jest na talerzu"))
+            } footer: {
+                Text(LocalizedDisplayText.text(
+                    "Editing a part updates the meal totals above.",
+                    polish: "Edycja części aktualizuje sumy powyżej."
+                ))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var assumptionsSection: some View {
+        if !assumptions.isEmpty {
+            Section {
+                AssumptionsSection(assumptions: assumptions)
+            } header: {
+                Text(LocalizedDisplayText.text("Assumptions", polish: "Założenia"))
+            }
+        }
     }
 
     private func updateOptionalBaseDouble(from text: String, set: (Double?) -> Void) {
@@ -290,6 +643,8 @@ struct FoodResultView: View {
                         }
                     }
 
+                    uncertaintySections
+
                     Section("Serving") {
                         HStack {
                             Text("Quantity")
@@ -335,7 +690,7 @@ struct FoodResultView: View {
                             editValue: MacroValueFormatter.string(scaledProtein),
                             unit: "g",
                             isUnlocked: nutritionUnlocked,
-                            onEdit: { updateBaseDouble(from: $0) { editableProtein = $0 } }
+                            onEdit: updateBaseProtein
                         )
                         ReviewNutritionValueRow(
                             label: "Carbs",
@@ -343,7 +698,7 @@ struct FoodResultView: View {
                             editValue: MacroValueFormatter.string(scaledCarbs),
                             unit: "g",
                             isUnlocked: nutritionUnlocked,
-                            onEdit: { updateBaseDouble(from: $0) { editableCarbs = $0 } }
+                            onEdit: updateBaseCarbs
                         )
                         ReviewNutritionValueRow(
                             label: "Fat",
@@ -351,7 +706,7 @@ struct FoodResultView: View {
                             editValue: MacroValueFormatter.string(scaledFat),
                             unit: "g",
                             isUnlocked: nutritionUnlocked,
-                            onEdit: { updateBaseDouble(from: $0) { editableFat = $0 } }
+                            onEdit: updateBaseFat
                         )
                     } header: {
                         HStack {
@@ -366,6 +721,8 @@ struct FoodResultView: View {
                             .accessibilityLabel(nutritionUnlocked ? "Lock nutrition editing" : "Unlock nutrition editing")
                         }
                     }
+
+                    componentsSection
 
                     Section {
                         DisclosureGroup("More Nutrition") {
@@ -394,6 +751,8 @@ struct FoodResultView: View {
                         }
                         .tint(AppColors.calorie)
                     }
+
+                    assumptionsSection
 
                     Section("Meal") {
                         Picker("Meal Type", selection: $mealType) {
@@ -499,7 +858,26 @@ struct FoodResultView: View {
             servingSizeGrams: servingSizeGrams,
             servingUnitOptions: servingUnitOptions,
             selectedServingUnit: servingUnitOptions.isEmpty ? nil : selectedServingOption.unit,
-            selectedServingQuantity: servingUnitOptions.isEmpty ? nil : selectedServingQuantity
+            selectedServingQuantity: servingUnitOptions.isEmpty ? nil : selectedServingQuantity,
+            analysisDetail: loggedAnalysisDetail
+        )
+    }
+
+    /// What gets stored with the diary entry. Questions are dropped — by this point the
+    /// user has answered them or decided not to — and the parts are reconciled against
+    /// the totals actually being saved so the stored breakdown always adds up.
+    private var loggedAnalysisDetail: MealAnalysisDetail {
+        MealAnalysisDetail(
+            components: scaledComponents,
+            calorieRange: displayedCalorieRange,
+            confidence: mealConfidence,
+            assumptions: assumptions
+        )
+        .reconciled(
+            toCalories: scaledCalories,
+            protein: scaledProtein,
+            carbs: scaledCarbs,
+            fat: scaledFat
         )
     }
 
@@ -909,7 +1287,7 @@ private extension UITouch {
     }
 }
 
-private struct ReviewNutritionValueRow: View {
+struct ReviewNutritionValueRow: View {
     let label: String
     let displayValue: String
     let editValue: String

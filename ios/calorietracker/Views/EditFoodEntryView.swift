@@ -53,6 +53,10 @@ struct EditFoodEntryView: View {
     @State private var isQuantityEditing = false
     @State private var mealType: MealType
     @State private var loggedAt: Date
+    /// The entry's component breakdown at its base serving size. This screen edits
+    /// meal totals rather than individual parts, so it is carried through rather than
+    /// shown — see FoodResultView for the per-part editor.
+    @State private var baseAnalysisDetail: MealAnalysisDetail
 
     private var scale: Double {
         guard baseServingSizeGrams > 0 else { return 1 }
@@ -106,6 +110,7 @@ struct EditFoodEntryView: View {
         self._baseCarbs = State(initialValue: entry.carbs)
         self._baseFat = State(initialValue: entry.fat)
         self._baseServingSizeGrams = State(initialValue: serving)
+        self._baseAnalysisDetail = State(initialValue: entry.analysisDetail)
         self._baseSugar = State(initialValue: entry.sugar)
         self._baseAddedSugar = State(initialValue: entry.addedSugar)
         self._baseFiber = State(initialValue: entry.fiber)
@@ -386,6 +391,9 @@ struct EditFoodEntryView: View {
                 baseCarbs = newAnalysis.carbs
                 baseFat = newAnalysis.fat
                 baseServingSizeGrams = newAnalysis.servingSizeGrams
+                // A re-run replaces the estimate wholesale, breakdown included; the
+                // old components describe an analysis that no longer exists.
+                baseAnalysisDetail = newAnalysis.analysisDetail.withoutQuestions
                 baseSugar = newAnalysis.sugar
                 baseAddedSugar = newAnalysis.addedSugar
                 baseFiber = newAnalysis.fiber
@@ -475,7 +483,18 @@ struct EditFoodEntryView: View {
             servingUnitOptions: servingUnitOptions,
             selectedServingUnit: servingUnitOptions.isEmpty ? nil : selectedServingOption.unit,
             selectedServingQuantity: servingUnitOptions.isEmpty ? nil : selectedServingQuantity,
-            customNote: customNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : customNote
+            customNote: customNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : customNote,
+            // This screen edits the meal totals, not the individual parts, so the
+            // breakdown is carried over and rescaled to whatever the totals became.
+            // Dropping it would silently lose the analysis detail on any edit.
+            analysisDetail: baseAnalysisDetail
+                .scaled(by: scale)
+                .reconciled(
+                    toCalories: scaledCalories,
+                    protein: scaledProtein,
+                    carbs: scaledCarbs,
+                    fat: scaledFat
+                )
         )
         foodStore.updateEntry(updated)
         dismiss()
