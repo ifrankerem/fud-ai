@@ -82,6 +82,9 @@ struct MealComponentRow: View {
     let onEditCarbs: (String) -> Void
     let onEditFat: (String) -> Void
     let onRemove: () -> Void
+    /// Optional so the row still works in contexts that only edit nutrition.
+    var onEditName: ((String) -> Void)?
+    var onEditPreparation: ((String) -> Void)?
 
     @State private var isExpanded = false
 
@@ -91,6 +94,28 @@ struct MealComponentRow: View {
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
+            if let onEditName {
+                HStack {
+                    Text(LocalizedDisplayText.text("Name", polish: "Nazwa"))
+                    Spacer()
+                    TextField(
+                        LocalizedDisplayText.text("Name", polish: "Nazwa"),
+                        text: Binding(get: { component.name }, set: onEditName)
+                    )
+                    .multilineTextAlignment(.trailing)
+                }
+            }
+            if let onEditPreparation {
+                HStack {
+                    Text(LocalizedDisplayText.text("Preparation", polish: "Przygotowanie"))
+                    Spacer()
+                    TextField(
+                        LocalizedDisplayText.text("e.g. grilled", polish: "np. grillowane"),
+                        text: Binding(get: { component.preparationMethod ?? "" }, set: onEditPreparation)
+                    )
+                    .multilineTextAlignment(.trailing)
+                }
+            }
             ReviewNutritionValueRow(
                 label: "Amount",
                 displayValue: MealComponentFormat.grams(component.grams),
@@ -134,8 +159,24 @@ struct MealComponentRow: View {
                 dim: true,
                 onEdit: onEditFat
             )
+            // Where the amount came from is stated rather than editable: it is a
+            // fact about the estimate, and the user changes it by correcting the
+            // amount, which marks it measured.
+            HStack {
+                Text(LocalizedDisplayText.text("Amount from", polish: "Źródło ilości"))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Label(component.quantitySource.displayLabel, systemImage: component.quantitySource.symbolName)
+                    .font(.subheadline)
+                    .foregroundStyle(component.quantitySource.isExact ? AppColors.calorie : .secondary)
+            }
             if let note = component.note {
                 Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(Array(component.uncertainties.enumerated()), id: \.offset) { _, uncertainty in
+                Label(uncertainty, systemImage: "questionmark.circle")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -163,9 +204,22 @@ struct MealComponentRow: View {
                                 )
                         }
                     }
-                    Text(summary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 5) {
+                        Text(summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        // A measured amount is worth pointing out; a guess is the
+                        // default and does not need a badge on every row.
+                        if component.quantitySource.isExact {
+                            Label(
+                                component.quantitySource.displayLabel,
+                                systemImage: component.quantitySource.symbolName
+                            )
+                            .font(.caption2.weight(.semibold))
+                            .labelStyle(.titleAndIcon)
+                            .foregroundStyle(AppColors.calorie)
+                        }
+                    }
                 }
                 Spacer(minLength: 4)
                 if let confidence = component.confidence {
