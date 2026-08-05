@@ -175,8 +175,25 @@ enum MealAnalysisResponseParser {
             guard let item = element as? [String: Any] else { continue }
             guard let text = string(item["question"] ?? item["text"] ?? item["prompt"]) else { continue }
 
-            let options = parseStringList(item["options"] ?? item["answers"] ?? item["choices"], keys: ["text", "label"])
-            let kind = ClarifyingQuestionKind.parse(item["type"] ?? item["kind"], optionCount: options.count)
+            let rawOptions = item["options"] ?? item["answers"] ?? item["choices"]
+            let options = parseStringList(rawOptions, keys: ["text", "label"])
+
+            // What control to show has to be knowable, not guessed. A declared type
+            // settles it. Failing that, an options key means the model meant a
+            // choice — even if it only managed one, in which case the question is
+            // malformed and gets dropped downstream rather than being silently
+            // reclassified as a typing prompt. A bare question with neither is
+            // under-specified, and offering a free-text box for it hands the user
+            // a chore they will not do.
+            let declaredKind = item["type"] ?? item["kind"]
+            let kind: ClarifyingQuestionKind
+            if declaredKind != nil {
+                kind = ClarifyingQuestionKind.parse(declaredKind, optionCount: options.count)
+            } else if rawOptions != nil {
+                kind = .singleChoice
+            } else {
+                continue
+            }
 
             questions.append(
                 ClarifyingQuestion(

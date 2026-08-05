@@ -147,15 +147,37 @@ struct MealAnalysisResponseParserTests {
 
     // MARK: - Questions
 
-    @Test func inferredKindWhenTypeIsMissing() {
+    /// Options without a declared type mean a choice — that is what options are for.
+    @Test func optionsImplyAChoiceWhenTypeIsMissing() {
+        let detail = parse([
+            "questions": [["id": "a", "question": "Grilled or fried?", "options": ["Grilled", "Fried"]]]
+        ])
+        #expect(detail.questions.first?.kind == .singleChoice)
+    }
+
+    /// A single option is a malformed choice, not a free-text question. Silently
+    /// reclassifying it would turn "Grilled?" into a typing prompt.
+    @Test func malformedChoiceIsDroppedRatherThanReclassified() {
         let detail = parse([
             "questions": [
-                ["id": "a", "question": "Grilled or fried?", "options": ["Grilled", "Fried"]],
-                ["id": "b", "question": "Describe the sauce"]
+                ["id": "broken", "question": "Grilled?", "options": ["Yes"]],
+                ["id": "ok", "question": "Sauce?", "options": ["Yes", "No"]]
             ]
         ])
-        #expect(detail.questions.first { $0.id == "a" }?.kind == .singleChoice)
-        #expect(detail.questions.first { $0.id == "b" }?.kind == .freeText)
+        #expect(detail.questions.map(\.id) == ["ok"])
+    }
+
+    /// Neither a type nor options means the control to show is unknowable.
+    /// Offering a free-text box hands the user a chore they will not do.
+    @Test func underSpecifiedQuestionIsDropped() {
+        #expect(parse(["questions": [["id": "a", "question": "Describe the sauce"]]]).questions.isEmpty)
+    }
+
+    @Test func explicitFreeTextIsHonoured() {
+        let detail = parse([
+            "questions": [["id": "a", "type": "free_text", "question": "Describe the sauce"]]
+        ])
+        #expect(detail.questions.first?.kind == .freeText)
     }
 
     @Test func readsNumericQuestionUnit() {
